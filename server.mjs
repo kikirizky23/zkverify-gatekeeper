@@ -94,11 +94,16 @@ if (!STEAL_SECRET) {
   process.exit(1);
 }
 
-// The registered Steal commitment (vk_hash). A turn whose
-// strategyCommitment.hash differs is answered HOLD (fail-closed);
-// the platform freezes the commitment at pairing.
+// The registered Steal commitment (dashboard, kixbt-steal, re-registered
+// 2026-11-16T14:53:26Z). This is Poseidon_73(STRATEGY_PARAMS, salt=1) —
+// NOT the vfyPolicy vk_hash (0x6c56509f…be047). The vk_hash was registered
+// by mistake and can never match a proof's commitment (254-bit preimage),
+// which is why every Steal proof was rejected with proof_failure −2.
+// A turn whose strategyCommitment.hash differs is answered HOLD
+// (fail-closed); the platform freezes the commitment at pairing.
+// MUST match prove-steal.mjs::REGISTERED_COMMITMENT_HEX.
 const STEAL_COMMITMENT =
-  '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047';
+  '0x16b3ed1bc216831d62c8e5c3957d0b7dc6e6c880885092f54357aacc826dc0ef';
 
 const MAX_BODY = 1_000_000; // 1 MB — envelopes are a few KB
 const PROVE_TIMEOUT_MS = 10_000; // hard proving timeout (plan §6.3)

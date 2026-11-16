@@ -12,14 +12,19 @@
 //   wire1 = Poseidon_153(matchId, turnNumber, circuitVersion) (public
 //   output); commitment = Poseidon_73(strategyParams[0..7], salt).
 //
-// Registered commitment (vk_hash, /api/circuit-info + GET commitment):
-//   0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047
-//   (commitmentHash == vfyPolicy vkHash; strategy "Optimal Strategy").
-//   NOTE: the vk_hash is the REGISTERED circuit identity (checked by the
-//   server against the envelope's strategyCommitment.hash). It is NOT the
-//   circuit's `commitment` input — that input is Poseidon(strategyParams,
-//   salt), a per-proof binding of the policy params. The old code set
-//   commitment = encodeVkHash(vk_hash), which is WRONG (fails L72).
+// Registered commitment — FIXED 2026-11-16 (was vk_hash, which was WRONG):
+//   0x16b3ed1bc216831d62c8e5c3957d0b7dc6e6c880885092f54357aacc826dc0ef
+//   = Poseidon_73(STRATEGY_PARAMS, FIXED_SALT=1), decimal
+//   10268784755669786268000742543790426075495395557280715493243260025004759040239.
+//   The dashboard originally held the vfyPolicy vk_hash
+//   (0x6c56509f…be047) as the commitment. That can never match a proof:
+//   the circuit's `commitment` public input is Poseidon(strategyParams,
+//   salt), and no salt makes Poseidon equal the vk_hash (254-bit
+//   preimage). Every Steal proof (7×, 13:05–13:35 UTC) was rejected with
+//   proof_failure −2 for exactly this mismatch. Re-registered on the
+//   dashboard 2026-11-16T14:53:26Z; the salt MUST stay 1 and the params
+//   MUST stay STRATEGY_PARAMS, or publicSignals[1] diverges from the
+//   registered commitment again (harness asserts this).
 //
 // ---- CIRCUIT — SOLVED 16 Nov 2026 (see circuit-steal/WIRING-TRACE.md) ----
 // The witness calculation on the UNPATCHED wasm used to fail at exactly
@@ -47,7 +52,6 @@
 
 import * as snarkjs from 'snarkjs';
 import { buildPoseidon } from 'circomlibjs';
-import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -108,6 +112,22 @@ export const CIRCUIT_VERSION_FIELD = '1';
  * envelope state are NOT policy inputs to this circuit.
  */
 export const STRATEGY_PARAMS = ['10', '30', '0', '0', '0', '0', '0', '0'];
+
+// Fixed salt for the strategy commitment. The salt is a private circuit
+// input, but it MUST be fixed (not random): the registered commitment is
+// Poseidon_73(STRATEGY_PARAMS, FIXED_SALT), and the platform checks the
+// proof's publicSignals[1] against the registered value. A random salt
+// per proof (the old code) makes every proof's commitment differ from
+// the registered one, so every proof is rejected (7× proof_failure).
+export const FIXED_SALT = '1';
+
+// The registered Steal commitment (dashboard, kixbt-steal), as a decimal
+// field element and as hex. MUST equal Poseidon_73(STRATEGY_PARAMS,
+// FIXED_SALT); MUST match server.mjs::STEAL_COMMITMENT (same hex).
+export const REGISTERED_COMMITMENT =
+  '10268784755669786268000742543790426075495395557280715493243260025004759040239';
+export const REGISTERED_COMMITMENT_HEX =
+  '0x16b3ed1bc216831d62c8e5c3957d0b7dc6e6c880885092f54357aacc826dc0ef';
 
 export function encodeStrategyParams(/* state — ignored: policy is fixed */) {
   return [...STRATEGY_PARAMS];
@@ -210,11 +230,9 @@ export async function generatePolicyProof(args) {
     if (n < 1n || n > 10n) throw new Error(`prove-steal: EXTRACT amount out of range: ${amount}`);
   }
 
-  // Fresh random salt per proof. Private input, never in the public
-  // signals; fresh salt gives unlinkable commitments.
-  const salt = (
-    BigInt('0x' + randomBytes(31).toString('hex')) % BN128_PRIME
-  ).toString();
+  // FIXED salt (see FIXED_SALT): the proof's commitment must equal the
+  // registered Poseidon commitment, so the salt cannot be random.
+  const salt = FIXED_SALT;
 
   // Fixed policy params + Poseidon commitment (circuit L72).
   const strategyParams = encodeStrategyParams(a.state);

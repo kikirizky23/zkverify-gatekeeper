@@ -25,6 +25,7 @@ import {
   verifyPolicyProof,
   encodeMatchId,
   STRATEGY_PARAMS,
+  REGISTERED_COMMITMENT,
 } from './prove-steal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,8 +34,10 @@ const GK_SECRET = 'dummy-test-secret-NEVER-USE-IN-PRODUCTION';
 const STEAL_SECRET = 'dummy-steal-secret-NEVER-USE-IN-PRODUCTION';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'steal-harness-'));
 const STATE_PATH = path.join(TMP, 'state.json');
+// Envelope commitment hash used by the harness (must equal the
+// REGISTERED commitment — was the vk_hash, fixed 2026-11-16).
 const COMMITMENT =
-  '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047';
+  '0x16b3ed1bc216831d62c8e5c3957d0b7dc6e6c880885092f54357aacc826dc0ef';
 
 let passed = 0;
 let failed = 0;
@@ -219,6 +222,15 @@ async function main() {
       ps[3] === '3' && ps[4] === '95' && ps[5] === '105' &&
       ps[6] === '2' && ps[7] === '10' && ps[8] === '1',
       `ps=${JSON.stringify(ps)}`,
+    );
+    // The gap that let the bleed ship: the old harness never asserted
+    // the commitment. The platform checks publicSignals[1] against the
+    // REGISTERED commitment (dashboard); a random salt made every proof
+    // diverge from it (7× proof_failure −2). This must never regress.
+    check(
+      'prove-steal: publicSignals[1] (commitment) equals the REGISTERED commitment (Poseidon, salt=1)',
+      ps[1] === REGISTERED_COMMITMENT,
+      `ps[1]=${ps[1]} registered=${REGISTERED_COMMITMENT}`,
     );
   } else {
     check('prove-steal: proof VERIFIES against circuit-steal/vk.json', false, 'no proof generated');
