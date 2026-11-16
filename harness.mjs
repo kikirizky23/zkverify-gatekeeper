@@ -443,11 +443,16 @@ async function main() {
         `body=${r.body}`,
       );
     }
-    // 12. Boundary APPROVE: current == expiry, amount == max, balance == minimum
+    // 12. EXPIRED_CONDITION boundary: current == expiry → REJECT + proof.
+    // The circuit requires current < expiry strictly, so == is expired
+    // (an APPROVE proof here would throw the circuit assert). amount ==
+    // max and balance == minimum stay valid boundaries, so the REJECT is
+    // due to expiry alone.
     {
+      const t0 = Date.now();
       const r = await request({
         body: task(
-          'gk_test_boundary',
+          'gk_test_boundary_expired',
           baseInput({
             current_block: 8430000,
             amount: '1000',
@@ -455,9 +460,39 @@ async function main() {
           }),
         ),
       });
+      const trapMs = Date.now() - t0;
+      const j = parse(r);
+      const proofOk =
+        r.status === 200 &&
+        j?.decision === 'REJECT' &&
+        j?.reason_code === 'EXPIRED_CONDITION' &&
+        'proof' in j &&
+        Array.isArray(j.public_signals) &&
+        j.public_signals.length === 13 &&
+        j.public_signals[11] === '0' &&
+        sigValid(r);
+      const verifies = proofOk && (await verifyProof(j));
+      check(
+        'EXPIRED_CONDITION boundary (current==expiry) → REJECT + proof (pub[11]="0", verifies, valid sig)',
+        proofOk && verifies,
+        `status=${r.status} body=${String(r.body).slice(0, 200)}`,
+      );
+      check('TRAP proving wall-clock < 10s', trapMs < 10_000, `${trapMs}ms`);
+    }
+    // 12b. Boundary APPROVE: amount == max, balance == minimum (current < expiry)
+    {
+      const r = await request({
+        body: task(
+          'gk_test_boundary_ok',
+          baseInput({
+            amount: '1000',
+            public_balance: '1000',
+          }),
+        ),
+      });
       const j = parse(r);
       check(
-        'boundary (current==expiry, amount==max, balance==minimum) → APPROVE',
+        'boundary (amount==max, balance==minimum, current<expiry) → APPROVE',
         r.status === 200 && j?.decision === 'APPROVE' && j?.reason_code === 'VALID_CONDITION',
         `body=${r.body}`,
       );

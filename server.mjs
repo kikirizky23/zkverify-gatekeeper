@@ -125,6 +125,9 @@ try {
   // missing/corrupt state: start empty (fail safe — reuse detection only
   // loses history it never had; decisions are recomputed, not invented)
 }
+console.log(
+  `state loaded from ${STATE_PATH}: ${Object.keys(state.proofOwners).length} proof owners, ${Object.keys(state.decisions).length} decisions, ${Object.keys(state.stealMatches).length} steal matches`,
+);
 // Atomic write (temp file + rename) so a crash mid-write cannot leave a
 // corrupt state.json. Returns true on success, false on failure.
 function saveState() {

@@ -8,7 +8,7 @@
 //   VK_SUBSTITUTION    — input.proof_vk !== input.registered_vk
 //   PROOF_REUSED       — input.proof_tx already seen on a DIFFERENT task_id
 //   THRESHOLD_MISMATCH — public_balance < minimum
-//   EXPIRED_CONDITION  — current_block > expiry_block
+//   EXPIRED_CONDITION  — current_block >= expiry_block
 //   RECIPIENT_MISMATCH — recipient !== condition_recipient
 //   AMOUNT_OVERFLOW    — amount > max_transfer, amount > public_balance,
 //                        or amount <= 0
@@ -81,12 +81,15 @@ export function decide(input, findProofOwner) {
     return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH' };
   }
 
-  // 4. EXPIRED_CONDITION — current_block must be <= expiry_block.
-  // Boundary: current == expiry is still valid (expiry block is the last
-  // valid block). Only strictly-greater is expired.
+  // 4. EXPIRED_CONDITION — current_block must be < expiry_block.
+  // Boundary: the circuit requires current < expiry STRICTLY — an
+  // APPROVE proof with current == expiry throws the circuit assert
+  // (GatekeeperEvaluation line 102), so == is expired. The platform's
+  // expected answer must match the circuit (otherwise the task would be
+  // unprovable), so decide() aligns with it: current >= expiry → REJECT.
   const expiry = toBig(inp.expiry_block);
   const current = toBig(inp.current_block);
-  if (expiry === null || current === null || current > expiry) {
+  if (expiry === null || current === null || current >= expiry) {
     return { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION' };
   }
 
