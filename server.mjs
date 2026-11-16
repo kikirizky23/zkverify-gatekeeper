@@ -1,7 +1,7 @@
-// server.mjs — Proof Gatekeeper agent (LOGIC-ONLY pass).
-// Node 22 stdlib only. Listens on $PORT (default 3000), handler POST /agent.
+// server.mjs — Proof Gatekeeper agent (GROTH16 proof pass, v1.1.0).
+// Node 22 + snarkjs 0.7.6. Listens on $PORT (default 3000), handler POST /agent.
 //
-// Protocol (source of truth: ../build-spec.txt, §02):
+// Protocol (source of truth: ../build-spec.txt, §02; proving plan ../groth16-plan.md):
 //   POST /agent
 //   - Every inbound request carries x-agent-games-signature = HMAC-SHA256
 //     (hex) of the RAW request body, keyed by AGENT_GAMES_HMAC_SECRET.
@@ -11,13 +11,18 @@
 //   - Task       { "type": "agent-games.proof-gatekeeper.v1", "task_id",
 //                  "mode", "issued_at", "deadline_at", "input": {...} }
 //     → { "decision": "APPROVE"|"REJECT", "reason_code": "...",
-//         "proof_tx": "<echoed when present>" }, signed.
-//   - LOGIC-ONLY: `proof` / `public_signals` are OMITTED. Per the spec an
-//     omitted proof costs −2; a correct decision still scores +12 −2.
-//     (Groth16/snarkjs proof generation is a later pass, not this build.)
+//         "proof_tx": "<echoed when present>",
+//         "proof": "<Groth16 proof>", "public_signals": ["<13 decimal strings>"] }, signed.
+//   - GROTH16: a proof is attached on every provable task (APPROVE and
+//     REJECT). Proving is a BEST-EFFORT annotation AFTER the decision is
+//     computed and recorded: on ANY proving failure/timeout the response is
+//     the exact logic-only response (decision + reason_code), which costs
+//     the same −2 as an omitted proof and never changes the decision.
+//     VK_SUBSTITUTION tasks are logic-only by design (plan §6.2).
 //   - Every response carries x-agent-games-signature over the raw body.
 //   - Fail closed: any error/uncertainty → REJECT, never approve by default.
-//   - 60s hard deadline: decision logic is synchronous microseconds.
+//   - 60s hard deadline: decision is synchronous microseconds; proving is
+//     capped at a 10s hard timeout (measured ~1s), leaving 50s headroom.
 //
 // State (state.json next to this file, or $STATE_PATH):
 //   { "proofOwners": { "<proof_tx>": "<task_id>" },
@@ -31,6 +36,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decide, issuedAtSane } from './decision.mjs';
+import { generateProof } from './prove.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -48,6 +54,7 @@ if (!SECRET) {
 }
 
 const MAX_BODY = 1_000_000; // 1 MB — envelopes are a few KB
+const PROVE_TIMEOUT_MS = 10_000; // hard proving timeout (plan §6.3)
 
 // ---- state ---------------------------------------------------------------
 let state = { proofOwners: {}, decisions: {} };
@@ -64,13 +71,29 @@ try {
   // missing/corrupt state: start empty (fail safe — reuse detection only
   // loses history it never had; decisions are recomputed, not invented)
 }
+// Atomic write (temp file + rename) so a crash mid-write cannot leave a
+// corrupt state.json. Returns true on success, false on failure.
 function saveState() {
+  const tmpPath = STATE_PATH + '.tmp';
   try {
-    fs.writeFileSync(STATE_PATH, JSON.stringify(state), 'utf8');
+    fs.writeFileSync(tmpPath, JSON.stringify(state), 'utf8');
+    fs.renameSync(tmpPath, STATE_PATH);
+    return true;
   } catch (e) {
     console.error('WARN: could not persist state:', e.message);
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {}
+    return false;
   }
 }
+
+// In-flight proving promises, keyed by task_id. A replay that arrives
+// while the first request is still proving awaits this promise so it gets
+// the SAME proof-bearing response — never the interim logic-only record
+// (Codex review round 1, MAJOR). The promise always resolves (tryProve
+// never throws; saveState never throws), so awaiting it cannot hang.
+const inflight = new Map();
 
 // ---- HMAC ----------------------------------------------------------------
 function hmacHex(secret, body) {
@@ -117,6 +140,73 @@ function readRawBody(req) {
   });
 }
 
+// ---- proving (Groth16, additive + fail-closed) ---------------------------
+// tryProve returns { proof, public_signals } or null. Null means
+// "logic-only" — the decision is unchanged. It NEVER throws.
+// Skips proving by design when the proof's VK is missing or substituted
+// (plan §6.2): the circuit only checks registeredVkHash == proofVkHash,
+// so a proof for a substituted VK would carry the WRONG hash and fail
+// platform verification; the REJECT is already correct without it.
+async function tryProve(input, decision, taskId) {
+  const regVk =
+    typeof input.registered_vk === 'string'
+      ? input.registered_vk.trim().toLowerCase()
+      : '';
+  const proofVk =
+    typeof input.proof_vk === 'string' ? input.proof_vk.trim().toLowerCase() : '';
+  if (!regVk || !proofVk || regVk !== proofVk) return null;
+
+  // NOTE (accepted limitation, plan §6.3 + Codex review round 1, MAJOR):
+  // the 10s timeout only races the promise — it does NOT cancel a
+  // running generateProof(). A timed-out prove keeps running in the
+  // background until it finishes. This is accepted because the measured
+  // path is stable (~1s), the game sends at most 8 tasks/round, and the
+  // timeout still guarantees the RESPONSE deadline (the response is sent
+  // logic-only at 10s regardless). The plan explicitly prefers in-process
+  // proving first and a killable child process only if load testing shows
+  // instability. If proving ever exceeds 10s systematically on Railway,
+  // move generateProof() into a child process with a hard kill.
+  let timer;
+  try {
+    const out = await Promise.race([
+      generateProof({
+        taskId,
+        minimum: input.minimum,
+        publicBalance: input.public_balance,
+        expiryBlock: input.expiry_block,
+        currentBlock: input.current_block,
+        recipient: input.recipient,
+        conditionRecipient: input.condition_recipient,
+        amount: input.amount,
+        maxTransfer: input.max_transfer,
+        proofVkHash: input.proof_vk,
+        decision,
+      })
+        .then((r) => ({ ok: true, ...r }))
+        .catch((e) => ({ ok: false, error: e })),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ ok: false, error: new Error('prove timeout') }),
+          PROVE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (!out || !out.ok) {
+      console.error(`prove failed task ${taskId}: ${out?.error?.message || 'unknown'}`);
+      return null;
+    }
+    console.log(
+      `prove ok task ${taskId} taskIdField=${out.taskIdField} encoding=${out.taskIdEncoding} decision=${decision}`,
+    );
+    return { proof: out.proof, public_signals: out.publicSignals };
+  } catch (e) {
+    console.error(`prove failed task ${taskId}: ${e.message}`);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ---- /agent ---------------------------------------------------------------
 async function handleAgent(req, res) {
   let raw;
@@ -157,7 +247,20 @@ async function handleAgent(req, res) {
     const taskId = typeof env.task_id === 'string' ? env.task_id : '';
 
     // Idempotent replay: same task_id → same stored decision.
+    // If a first request is still proving, await its final response so
+    // the replay gets the SAME proof-bearing response, not the interim
+    // logic-only record (Codex review round 1, MAJOR).
     if (taskId && state.decisions[taskId]) {
+      const pending = inflight.get(taskId);
+      if (pending) {
+        try {
+          const finalResponse = await pending;
+          sendSigned(res, 200, finalResponse);
+        } catch {
+          sendSigned(res, 200, state.decisions[taskId]);
+        }
+        return;
+      }
       sendSigned(res, 200, state.decisions[taskId]);
       return;
     }
@@ -188,20 +291,67 @@ async function handleAgent(req, res) {
       ...(typeof env.input?.proof_tx === 'string' && env.input.proof_tx
         ? { proof_tx: env.input.proof_tx }
         : {}),
-      // NOTE (logic-only): `proof` and `public_signals` are intentionally
-      // omitted. Cost: −2 per task; correct decision still scores +12 −2.
     };
 
-    // Record outcome (only first owner of a proof_tx wins).
+    // Record the decision FIRST (durable even if proving then fails).
+    // Only the first owner of a proof_tx wins.
+    // If this save fails, persistence is broken: skip proving and send
+    // logic-only (Codex review round 2, MAJOR). A proof is only ever sent
+    // when it is durably stored, so sent == stored for proof-bearing
+    // responses. The correct decision is still sent even when the disk
+    // fails — returning a 500 would cost the task outright.
+    let persisted = true;
     if (taskId) {
       state.decisions[taskId] = response;
       const proofTx = env.input?.proof_tx;
       if (typeof proofTx === 'string' && proofTx) {
         if (!state.proofOwners[proofTx]) state.proofOwners[proofTx] = taskId;
       }
-      saveState();
+      persisted = saveState();
+      if (!persisted) {
+        console.error(`state save failed task ${taskId}: sending logic-only, proving skipped`);
+      }
     }
-    sendSigned(res, 200, response);
+
+    // Proving is a best-effort annotation AFTER the decision is recorded.
+    // On any failure/timeout the response stays logic-only (today's exact
+    // behaviour, −2 — never worse). Proving never changes the decision.
+    // VK_SUBSTITUTION tasks are skipped inside tryProve (by design, §6.2).
+    // The in-flight promise is tracked so a concurrent replay awaits the
+    // final (proof-bearing) response instead of the interim record.
+    let finalResponse = response;
+    if (taskId && persisted) {
+      const provePromise = (async () => {
+        const proved = await tryProve(env.input || {}, result.decision, taskId);
+        if (proved) {
+          const withProof = {
+            ...response,
+            proof: proved.proof,
+            public_signals: proved.public_signals,
+          };
+          state.decisions[taskId] = withProof;
+          if (saveState()) {
+            return withProof;
+          }
+          // Persist failed: send logic-only so the sent response matches
+          // what is durably stored (Codex review round 1, MINOR). The
+          // decision is unchanged; only the proof is withheld.
+          console.error(
+            `prove ok but state save failed task ${taskId}: sending logic-only`,
+          );
+          state.decisions[taskId] = response;
+          return response;
+        }
+        return response;
+      })();
+      inflight.set(taskId, provePromise);
+      try {
+        finalResponse = await provePromise;
+      } finally {
+        inflight.delete(taskId);
+      }
+    }
+    sendSigned(res, 200, finalResponse);
     return;
   }
 
@@ -222,7 +372,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         service: 'proof-gatekeeper',
         protocolVersion: 'v1',
-        mode: 'logic-only',
+        mode: 'groth16',
       });
       return;
     }
@@ -239,6 +389,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(
-    `gatekeeper listening on :${PORT} (POST /agent) — logic-only, proof omitted (−2/task)`,
+    `gatekeeper listening on :${PORT} (POST /agent) — groth16 proofs on (fail-closed to logic-only)`,
   );
 });

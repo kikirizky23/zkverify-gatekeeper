@@ -1,15 +1,22 @@
-# Proof Gatekeeper agent — LOGIC-ONLY pass
+# Proof Gatekeeper agent — GROTH16 proof pass (v1.1.0)
 
 Public HTTPS endpoint for zkVerify Agent Games (handle `kixbt`,
 competitionUserId `ac0ceb56-99b8-45a7-8809-6f75f322dfea`,
 wallet `0x5750068fb2e240015993d4d06e4da7dc3ba0100a`).
 
-**Scope of this pass: LOGIC-ONLY.** The endpoint, HMAC auth, preflight,
+**Scope of this pass: GROTH16 proofs.** The endpoint, HMAC auth, preflight,
 decision engine (7 trap types) and response signing are complete and
-harness-verified. Groth16 proof generation (snarkjs + gatekeeper.wasm /
-gatekeeper_final.zkey) and zkVerify submission are NOT built yet.
-A correct decision without a valid proof still scores **+12 −2**
-(no reliability bonus) — see "Scoring note" below.
+harness-verified, and every provable task now also carries a Groth16 proof
+(`proof` + `public_signals`, 13 elements) generated with snarkjs 0.7.6 and
+the official `gatekeeper.wasm` / `gatekeeper_final.zkey`. Proving is a
+best-effort annotation AFTER the decision is computed and recorded: on any
+proving failure/timeout the response is the exact logic-only response
+(decision + reason_code), which costs the same −2 as an omitted proof and
+never changes the decision. VK_SUBSTITUTION tasks are logic-only by design.
+A correct decision with a valid proof scores the full **+12** plus the
+reliability bonus — see "Scoring note" below. The taskId encoding is the
+plan's §7.4 best guess (see `../groth16-plan.md` §7; single swappable
+`encodeTaskId` in `prove.mjs`).
 
 Source of truth: `../build-spec.txt` (Builder Field Guide extracted from
 https://agentgames.zkverify.io/build).
@@ -18,9 +25,11 @@ https://agentgames.zkverify.io/build).
 
 | File | What it is |
 |---|---|
-| `server.mjs` | HTTP server, Node 22 stdlib only. `POST /agent`, `GET /` + `/health`. |
+| `server.mjs` | HTTP server, Node 22 + snarkjs. `POST /agent`, `GET /` + `/health`. |
 | `decision.mjs` | Pure decision engine (importable, no I/O). |
-| `harness.mjs` | Local test harness — spawns the server, 19 assertions. |
+| `prove.mjs` | Groth16 proving (`generateProof`, `encodeTaskId`, `encodeVkHash`). |
+| `circuit/` | Official circuit artifacts: `gatekeeper.wasm`, `gatekeeper_final.zkey`, `vk.json`. |
+| `harness.mjs` | Local test harness — spawns the server, 23 assertions (incl. proof verify + failure injection). |
 | `.env.example` | `AGENT_GAMES_HMAC_SECRET=` + `PORT=3000`. Copy to `.env`. |
 | `.gitignore` | `.env`, `state.json`, `node_modules/`. |
 | `state.json` | Created at runtime: `{proofOwners, decisions}` (proof-reuse + replay memory). |
@@ -68,8 +77,10 @@ Response (signed, `x-agent-games-signature` over the raw body):
 {"decision":"REJECT","reason_code":"VK_SUBSTITUTION","proof_tx":"0xa8...2c"}
 ```
 
-`proof` / `public_signals` are **omitted** in this pass (see scoring note).
-`proof_tx` is echoed when present in the input.
+`proof` / `public_signals` are **attached** on every provable task
+(APPROVE and REJECT). They are omitted only when proving is skipped by
+design (VK_SUBSTITUTION) or fails (then the response is the exact
+logic-only response). `proof_tx` is echoed when present in the input.
 
 **Decision engine** (`decision.mjs`, fixed check order):
 1. `VK_SUBSTITUTION` — `proof_vk !== registered_vk` (case-insensitive; missing either side → REJECT).
@@ -85,18 +96,18 @@ Same `task_id` replayed returns the stored decision verbatim (idempotent).
 Any engine error → REJECT (fail closed, never approve by default).
 Response deadline is 60s; the decision path is synchronous (microseconds).
 
-## Scoring note (logic-only)
+## Scoring note (Groth16 pass)
 
 Per the spec §01 step 05 and the starter prompt: "an omitted or invalid
 proof costs −2". Scoring per task: correct decision **+12**, approving a
 trap **−6**, rejecting a valid request **−3**, timeout/offline **−2**,
 missing/invalid proof **−2**, plus a reliability bonus (verified proofs /
-tasks — logic-only gets none of this bonus). So a correct logic-only
-decision nets **+10**. The Groth16 pass (snarkjs + `gatekeeper.wasm` /
+tasks). A correct decision with a valid proof nets the full **+12** plus
+the bonus. The prover uses snarkjs 0.7.6 + `gatekeeper.wasm` /
 `gatekeeper_final.zkey`, vk_hash
-`0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`)
-recovers the +2 and the bonus — build it only if the parent decides the
-extra ~+2/task + bonus is worth the prover work.
+`0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`.
+If proving fails, the response falls back to logic-only (correct decision
+still nets +10) — the fallback is the permanent safety net.
 
 ## Spec ambiguities resolved (and how)
 

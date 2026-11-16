@@ -1,7 +1,9 @@
-// harness.mjs — local test harness for the Gatekeeper agent.
+// harness.mjs — local test harness for the Gatekeeper agent (GROTH16 pass).
 // Spawns server.mjs on a test port with a DUMMY secret, sends a signed
 // preflight + one task of EACH of the 7 trap types (built from the spec
-// §02 example envelope) + edge cases, and asserts decisions AND that every
+// §02 example envelope) + edge cases, and asserts decisions, Groth16 proofs
+// (present + verify on provable tasks, absent on VK_SUBSTITUTION), the
+// proving-failure fallback (logic-only, correct decision), and that every
 // response carries a valid x-agent-games-signature over the raw body.
 // Exit 0 = all pass, 1 = any failure. No network beyond localhost.
 // Usage: node harness.mjs
@@ -12,12 +14,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as snarkjs from 'snarkjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 3101;
 const SECRET = 'dummy-test-secret-NEVER-USE-IN-PRODUCTION';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-harness-'));
 const STATE_PATH = path.join(TMP, 'state.json');
+// Verification key for the circuit (public protocol artifact).
+const VK_JSON = JSON.parse(fs.readFileSync(path.join(__dirname, 'circuit', 'vk.json'), 'utf8'));
 
 let passed = 0;
 let failed = 0;
@@ -32,13 +37,15 @@ function check(name, ok, detail = '') {
 function hmacHex(body) {
   return crypto.createHmac('sha256', SECRET).update(body).digest('hex');
 }
-function request({ method = 'POST', path = '/agent', body, sign = true, rawBody }) {
+// port defaults to the main server; pass a different port for the
+// failure-injection server (Step 4 case).
+function request({ method = 'POST', path = '/agent', body, sign = true, rawBody, port = PORT }) {
   return new Promise((resolve, reject) => {
     const data = rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : '';
     const headers = { 'content-type': 'application/json' };
     if (sign) headers['x-agent-games-signature'] = hmacHex(data);
     const req = http.request(
-      { host: '127.0.0.1', port: PORT, path, method, headers },
+      { host: '127.0.0.1', port, path, method, headers },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -54,6 +61,16 @@ function request({ method = 'POST', path = '/agent', body, sign = true, rawBody 
     req.on('error', reject);
     req.end(data);
   });
+}
+async function verifyProof(j) {
+  if (!j || !j.proof || !Array.isArray(j.public_signals) || j.public_signals.length !== 13) {
+    return false;
+  }
+  try {
+    return await snarkjs.groth16.verify(VK_JSON, j.public_signals, j.proof);
+  } catch {
+    return false;
+  }
 }
 function sigValid(res) {
   const given = res.headers['x-agent-games-signature'];
@@ -73,7 +90,11 @@ const parse = (r) => {
 
 // ---- envelope builders (from spec §02 example) ---------------------------
 const ADDR = '0xDe4200000000000000000000000000000000009f01';
-const VK = '0x7d00000000000000000000000000000000000000000000000000000000000091';
+// Real registered vk_hash (plan §2.4) — the harness must use it so the
+// circuit's registeredVkHash == proofVkHash check passes and proving
+// succeeds. (A dummy VK would make every proof fail the circuit assert
+// and fall back to logic-only.)
+const VK = '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0';
 let n = 0;
 function proofTx() {
   n += 1;
@@ -197,36 +218,76 @@ async function main() {
       check('preflight missing signature → 401', r.status === 401, `status=${r.status}`);
     }
 
-    // 3. VALID_CONDITION → APPROVE (proof_tx #1, recorded for reuse test)
+    // 3. VALID_CONDITION → APPROVE + Groth16 proof (task_id gk_24_valid
+    // exercises the decimal taskId encoding: publicSignals[12] == "24").
     const validTx = proofTx();
     let validInput;
+    let validProofJson = '';
+    let validPubJson = '';
+    let validMs = 0;
     {
       validInput = baseInput({ proof_tx: validTx });
-      const r = await request({ body: task('gk_test_valid', validInput) });
+      const t0 = Date.now();
+      const r = await request({ body: task('gk_24_valid', validInput) });
+      validMs = Date.now() - t0;
+      const j = parse(r);
+      const proofOk =
+        r.status === 200 &&
+        j?.decision === 'APPROVE' &&
+        j?.reason_code === 'VALID_CONDITION' &&
+        j?.proof_tx === validTx &&
+        'proof' in j &&
+        Array.isArray(j.public_signals) &&
+        j.public_signals.length === 13 &&
+        j.public_signals[11] === '1' &&
+        j.public_signals[12] === '24' &&
+        sigValid(r);
+      const verifies = proofOk && (await verifyProof(j));
+      validProofJson = JSON.stringify(j?.proof);
+      validPubJson = JSON.stringify(j?.public_signals);
+      check(
+        'VALID_CONDITION → APPROVE + proof (13 pub signals, pub[11]="1", pub[12]="24", verifies, valid sig)',
+        proofOk && verifies,
+        `status=${r.status} body=${String(r.body).slice(0, 200)}`,
+      );
+      check('VALID proving wall-clock < 10s', validMs < 10_000, `${validMs}ms`);
+    }
+    // 4. replay same task_id → same APPROVE + same proof (idempotent, NOT PROOF_REUSED)
+    {
+      const r = await request({ body: task('gk_24_valid', validInput) });
       const j = parse(r);
       check(
-        'VALID_CONDITION → APPROVE / VALID_CONDITION, proof_tx echoed, valid sig, no proof field',
+        'replay same task_id → same APPROVE + identical proof (idempotent)',
         r.status === 200 &&
           j?.decision === 'APPROVE' &&
           j?.reason_code === 'VALID_CONDITION' &&
-          j?.proof_tx === validTx &&
-          !('proof' in j) &&
-          !('public_signals' in j) &&
-          sigValid(r),
-        `status=${r.status} body=${r.body}`,
+          JSON.stringify(j?.proof) === validProofJson &&
+          JSON.stringify(j?.public_signals) === validPubJson,
+        `body=${String(r.body).slice(0, 200)}`,
       );
     }
-    // 4. replay same task_id → same APPROVE (idempotent, NOT PROOF_REUSED)
+    // 4b. CONCURRENT replay: two identical requests in flight at once must
+    // both get the SAME proof-bearing response (the second awaits the
+    // first's in-flight prove instead of reading the interim record).
     {
-      const r = await request({ body: task('gk_test_valid', validInput) });
-      const j = parse(r);
+      const input = baseInput();
+      const env = task('gk_24_concurrent', input);
+      const [r1, r2] = await Promise.all([request({ body: env }), request({ body: env })]);
+      const j1 = parse(r1);
+      const j2 = parse(r2);
       check(
-        'replay same task_id → same APPROVE (idempotent)',
-        r.status === 200 && j?.decision === 'APPROVE' && j?.reason_code === 'VALID_CONDITION',
-        `body=${r.body}`,
+        'concurrent replay → both APPROVE with identical proof',
+        r1.status === 200 &&
+          r2.status === 200 &&
+          j1?.decision === 'APPROVE' &&
+          j2?.decision === 'APPROVE' &&
+          'proof' in j1 &&
+          'proof' in j2 &&
+          JSON.stringify(j1.proof) === JSON.stringify(j2.proof) &&
+          JSON.stringify(j1.public_signals) === JSON.stringify(j2.public_signals),
+        `r1=${String(r1.body).slice(0, 120)} r2=${String(r2.body).slice(0, 120)}`,
       );
     }
-    // 5. PROOF_REUSED — same proof_tx, new task_id
     {
       const r = await request({
         body: task('gk_test_reused', baseInput({ proof_tx: validTx })),
@@ -238,7 +299,7 @@ async function main() {
         `body=${r.body}`,
       );
     }
-    // 6. VK_SUBSTITUTION
+    // 6. VK_SUBSTITUTION — correct REJECT, NO proof (by design, plan §6.2)
     {
       const r = await request({
         body: task(
@@ -248,22 +309,40 @@ async function main() {
       });
       const j = parse(r);
       check(
-        'VK_SUBSTITUTION → REJECT / VK_SUBSTITUTION',
-        r.status === 200 && j?.decision === 'REJECT' && j?.reason_code === 'VK_SUBSTITUTION',
+        'VK_SUBSTITUTION → REJECT / VK_SUBSTITUTION, no proof attached (by design)',
+        r.status === 200 &&
+          j?.decision === 'REJECT' &&
+          j?.reason_code === 'VK_SUBSTITUTION' &&
+          !('proof' in j) &&
+          !('public_signals' in j) &&
+          sigValid(r),
         `body=${r.body}`,
       );
     }
-    // 7. THRESHOLD_MISMATCH
+    // 7. THRESHOLD_MISMATCH — REJECT, but WITH a valid proof (decision "0")
     {
+      const t0 = Date.now();
       const r = await request({
         body: task('gk_test_threshold', baseInput({ public_balance: '900' })),
       });
+      const trapMs = Date.now() - t0;
       const j = parse(r);
+      const proofOk =
+        r.status === 200 &&
+        j?.decision === 'REJECT' &&
+        j?.reason_code === 'THRESHOLD_MISMATCH' &&
+        'proof' in j &&
+        Array.isArray(j.public_signals) &&
+        j.public_signals.length === 13 &&
+        j.public_signals[11] === '0' &&
+        sigValid(r);
+      const verifies = proofOk && (await verifyProof(j));
       check(
-        'THRESHOLD_MISMATCH (balance 900 < minimum 1000) → REJECT',
-        r.status === 200 && j?.decision === 'REJECT' && j?.reason_code === 'THRESHOLD_MISMATCH',
-        `body=${r.body}`,
+        'THRESHOLD_MISMATCH → REJECT + proof (pub[11]="0", verifies, valid sig)',
+        proofOk && verifies,
+        `status=${r.status} body=${String(r.body).slice(0, 200)}`,
       );
+      check('TRAP proving wall-clock < 10s', trapMs < 10_000, `${trapMs}ms`);
     }
     // 8. EXPIRED_CONDITION
     {
@@ -378,11 +457,118 @@ async function main() {
     {
       const saved = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
       check(
-        'state.json persisted proof owners + decisions',
-        saved.proofOwners?.[validTx] === 'gk_test_valid' &&
-          saved.decisions?.['gk_test_valid']?.decision === 'APPROVE',
+        'state.json persisted proof owners + decisions (with proof stored)',
+        saved.proofOwners?.[validTx] === 'gk_24_valid' &&
+          saved.decisions?.['gk_24_valid']?.decision === 'APPROVE' &&
+          'proof' in (saved.decisions?.['gk_24_valid'] || {}),
         `owners=${Object.keys(saved.proofOwners || {}).length}`,
       );
+    }
+    // 18. STATE-SAVE FAILURE — a server whose state file cannot be written
+    // must still return the CORRECT logic-only decision (HTTP 200, signed)
+    // and must NOT attach a proof (a proof is only sent when durably
+    // stored). This covers the first-save-failure path (Codex round 2).
+    {
+      const SAVE_PORT = PORT + 2;
+      const saveChild = spawn(process.execPath, [path.join(__dirname, 'server.mjs')], {
+        env: {
+          ...process.env,
+          PORT: String(SAVE_PORT),
+          AGENT_GAMES_HMAC_SECRET: SECRET,
+          STATE_PATH: path.join(TMP, 'no-such-dir', 'state.json'),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let saveLog = '';
+      saveChild.stdout.on('data', (d) => (saveLog += d));
+      saveChild.stderr.on('data', (d) => (saveLog += d));
+      try {
+        let saveReady = false;
+        for (let i = 0; i < 50 && !saveReady; i++) {
+          try {
+            const r = await request({ method: 'GET', path: '/health', sign: false, port: SAVE_PORT });
+            saveReady = r.status === 200;
+          } catch {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        check('state-save-failure server starts (unwritable state path)', saveReady, saveLog.slice(-300));
+        if (saveReady) {
+          const r = await request({
+            body: task('gk_24_savefail', baseInput()),
+            port: SAVE_PORT,
+          });
+          const j = parse(r);
+          check(
+            'state save fails → correct logic-only APPROVE, HTTP 200, signed, no proof',
+            r.status === 200 &&
+              j?.decision === 'APPROVE' &&
+              j?.reason_code === 'VALID_CONDITION' &&
+              !('proof' in j) &&
+              !('public_signals' in j) &&
+              sigValid(r),
+            `status=${r.status} body=${String(r.body).slice(0, 200)}`,
+          );
+        }
+      } finally {
+        try {
+          saveChild.kill('SIGTERM');
+        } catch {}
+      }
+    }
+    // 19. PROVING-FAILURE INJECTION (MOST IMPORTANT case) — a second server
+    // with a corrupt zkey path must still return the CORRECT logic-only
+    // decision, HTTP 200, signed, with no proof. The decision path must
+    // survive a totally broken prover.
+    {
+      const FAIL_PORT = PORT + 1;
+      const FAIL_STATE = path.join(TMP, 'state-fail.json');
+      const failChild = spawn(process.execPath, [path.join(__dirname, 'server.mjs')], {
+        env: {
+          ...process.env,
+          PORT: String(FAIL_PORT),
+          AGENT_GAMES_HMAC_SECRET: SECRET,
+          STATE_PATH: FAIL_STATE,
+          GK_ZKEY_PATH: path.join(TMP, 'nonexistent', 'gatekeeper_final.zkey'),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let failLog = '';
+      failChild.stdout.on('data', (d) => (failLog += d));
+      failChild.stderr.on('data', (d) => (failLog += d));
+      try {
+        let failReady = false;
+        for (let i = 0; i < 50 && !failReady; i++) {
+          try {
+            const r = await request({ method: 'GET', path: '/health', sign: false, port: FAIL_PORT });
+            failReady = r.status === 200;
+          } catch {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        check('failure-injection server starts (bad zkey path)', failReady, failLog.slice(-300));
+        if (failReady) {
+          const r = await request({
+            body: task('gk_24_failinject', baseInput()),
+            port: FAIL_PORT,
+          });
+          const j = parse(r);
+          check(
+            'proving failure → logic-only APPROVE / VALID_CONDITION, HTTP 200, signed, no proof',
+            r.status === 200 &&
+              j?.decision === 'APPROVE' &&
+              j?.reason_code === 'VALID_CONDITION' &&
+              !('proof' in j) &&
+              !('public_signals' in j) &&
+              sigValid(r),
+            `status=${r.status} body=${String(r.body).slice(0, 200)}`,
+          );
+        }
+      } finally {
+        try {
+          failChild.kill('SIGTERM');
+        } catch {}
+      }
     }
   } finally {
     cleanup();
