@@ -263,8 +263,14 @@ async function main() {
     // SHA-256/decimal encoder silently produced a wrong field for them
     // (local verify still passed — the circuit accepts any field element
     // — so only the platform's check caught it: 3/3 R04 proofs failed).
-    // keccak256('task_R04_73ce3172-96b1-5d6c-1ed6-758a0e13921b') mod p =
-    // 16679359972765866072898342402363909424658053657850559231386290237167951157954.
+    // 2026-11-17 UUID-only change: the live verifier expects the BARE
+    // UUID (the scheduler's primary key; `task_R04_` is a display
+    // prefix), because the full-string keccak still failed 4/4 live
+    // proofs while practice verified. keccak256(
+    // '73ce3172-96b1-5d6c-1ed6-758a0e13921b') mod p =
+    // 16333367465669295831513480636736509515845368565026399551234605709260682720884.
+    // (Full-string keccak was
+    // 16679359972765866072898342402363909424658053657850559231386290237167951157954.)
     {
       const r = await request({
         body: task(
@@ -282,11 +288,11 @@ async function main() {
         j.public_signals.length === 13 &&
         j.public_signals[11] === '1' &&
         j.public_signals[12] ===
-          '16679359972765866072898342402363909424658053657850559231386290237167951157954' &&
+          '16333367465669295831513480636736509515845368565026399551234605709260682720884' &&
         sigValid(r);
       const verifies = proofOk && (await verifyProof(j));
       check(
-        'live-format task_R04_<uuid> → APPROVE + proof (pub[12]=keccak256(task_id) mod p, verifies, valid sig)',
+        'live-format task_R04_<uuid> → APPROVE + proof (pub[12]=keccak256(bare UUID) mod p, verifies, valid sig)',
         proofOk && verifies,
         `status=${r.status} body=${String(r.body).slice(0, 200)}`,
       );

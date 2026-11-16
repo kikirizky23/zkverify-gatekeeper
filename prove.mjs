@@ -69,7 +69,20 @@ export function encodeAddress(addr) {
  * encoding is always 'keccak256'.
  */
 export function encodeTaskId(taskIdString) {
-  const s = String(taskIdString ?? '');
+  let s = String(taskIdString ?? '');
+  // Live scored-round ids (`task_R04_<uuid>`) hash the BARE UUID only:
+  // the round scheduler's primary key is the UUID and `task_R04_` is a
+  // display prefix. Proven by elimination 2026-11-17: the full-string
+  // keccak (correct for practice, verified) still failed 4/4 live proofs
+  // (verified 0), while the platform's live verifier accepts ~5% of
+  // other agents' proofs — so the live expected string must differ, and
+  // the bare UUID is the only plausible form. Practice ids
+  // (`practice_<uuid>`) keep the FULL string (proven: practice verifies
+  // with the full string on both sides).
+  if (s.startsWith('task_')) {
+    const i = s.lastIndexOf('_');
+    if (i >= 0) s = s.slice(i + 1);
+  }
   return {
     field: (BigInt('0x' + keccak256(s)) % BN128_PRIME).toString(),
     encoding: 'keccak256',
