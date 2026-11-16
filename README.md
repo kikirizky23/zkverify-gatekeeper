@@ -12,9 +12,10 @@ proving failure/timeout the response is the exact logic-only response
 (decision + reason_code), which costs the same −2 as an omitted proof and
 never changes the decision. VK_SUBSTITUTION tasks are logic-only by design.
 A correct decision with a valid proof scores the full **+12** plus the
-reliability bonus. The taskId encoding is the plan's §7.4 best guess
-(see `../groth16-plan.md` §7; single swappable `encodeTaskId` in
-`prove.mjs`).
+reliability bonus. The taskId encoding is keccak256(utf8(task_id)) mod p
+(resolved 2026-11-16 after R04 failed 3/3 proofs on the old SHA-256/decimal
+guess; two independent agents report keccak256 verified live by the
+platform — see `encodeTaskId` in `prove.mjs`).
 
 **Steal the VFY (v1.2.0, NEW):** the same endpoint also serves the
 Steal agent (`kixbt-steal`, agentId `fc9d5827-a30c-4e1a-a7dc-7b16a1267c6e`)

@@ -220,8 +220,11 @@ async function main() {
       check('preflight missing signature → 401', r.status === 401, `status=${r.status}`);
     }
 
-    // 3. VALID_CONDITION → APPROVE + Groth16 proof (task_id gk_24_valid
-    // exercises the decimal taskId encoding: publicSignals[12] == "24").
+    // 3. VALID_CONDITION → APPROVE + Groth16 proof (task_id gk_24_valid;
+    // pub[12] is keccak256(utf8(task_id)) mod p — the platform's encoding,
+    // resolved 2026-11-16 after R04 failed 3/3 on the old SHA-256/decimal
+    // guess; keccak256('gk_24_valid') mod p =
+    // 1338957627488012790344726330931474282972543372566424965279925446828785139472).
     const validTx = proofTx();
     let validInput;
     let validProofJson = '';
@@ -242,17 +245,51 @@ async function main() {
         Array.isArray(j.public_signals) &&
         j.public_signals.length === 13 &&
         j.public_signals[11] === '1' &&
-        j.public_signals[12] === '24' &&
+        j.public_signals[12] ===
+          '1338957627488012790344726330931474282972543372566424965279925446828785139472' &&
         sigValid(r);
       const verifies = proofOk && (await verifyProof(j));
       validProofJson = JSON.stringify(j?.proof);
       validPubJson = JSON.stringify(j?.public_signals);
       check(
-        'VALID_CONDITION → APPROVE + proof (13 pub signals, pub[11]="1", pub[12]="24", verifies, valid sig)',
+        'VALID_CONDITION → APPROVE + proof (13 pub signals, pub[11]="1", pub[12]=keccak256("gk_24_valid") mod p, verifies, valid sig)',
         proofOk && verifies,
         `status=${r.status} body=${String(r.body).slice(0, 200)}`,
       );
       check('VALID proving wall-clock < 10s', validMs < 10_000, `${validMs}ms`);
+    }
+    // 3b. LIVE-FORMAT task_id (regression for R04): the platform's real
+    // scored-round ids are `task_R04_<uuid>`, NOT `gk_<n>`. The old
+    // SHA-256/decimal encoder silently produced a wrong field for them
+    // (local verify still passed — the circuit accepts any field element
+    // — so only the platform's check caught it: 3/3 R04 proofs failed).
+    // keccak256('task_R04_73ce3172-96b1-5d6c-1ed6-758a0e13921b') mod p =
+    // 16679359972765866072898342402363909424658053657850559231386290237167951157954.
+    {
+      const r = await request({
+        body: task(
+          'task_R04_73ce3172-96b1-5d6c-1ed6-758a0e13921b',
+          baseInput(),
+        ),
+      });
+      const j = parse(r);
+      const proofOk =
+        r.status === 200 &&
+        j?.decision === 'APPROVE' &&
+        j?.reason_code === 'VALID_CONDITION' &&
+        'proof' in j &&
+        Array.isArray(j.public_signals) &&
+        j.public_signals.length === 13 &&
+        j.public_signals[11] === '1' &&
+        j.public_signals[12] ===
+          '16679359972765866072898342402363909424658053657850559231386290237167951157954' &&
+        sigValid(r);
+      const verifies = proofOk && (await verifyProof(j));
+      check(
+        'live-format task_R04_<uuid> → APPROVE + proof (pub[12]=keccak256(task_id) mod p, verifies, valid sig)',
+        proofOk && verifies,
+        `status=${r.status} body=${String(r.body).slice(0, 200)}`,
+      );
     }
     // 4. replay same task_id → same APPROVE + same proof (idempotent, NOT PROOF_REUSED)
     {

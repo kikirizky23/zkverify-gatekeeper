@@ -8,13 +8,22 @@
 // wtns.calculate ~61 ms, groth16.prove ~859 ms, verify ~101 ms.
 //
 // Circuit inputs (13, plan §2.2) and public-signal order (13, plan §2.3)
-// are confirmed by experiment. The taskId encoding is the ONE unresolved
-// item (plan §7): encodeTaskId() below implements the §7.4 best guess as a
-// single swappable function. A wrong encoding costs the same −2 as an
-// omitted proof (free option); a right one gains +2/task + bonus.
+// are confirmed by experiment. The taskId encoding is RESOLVED (2026-11-16):
+// keccak256(utf8(task_id)) mod p — see encodeTaskId() below. The previous
+// §7.4 best guess (decimal for `gk_<n>`, else SHA-256) was WRONG: R04
+// scored 3/3 correct decisions but 0/3 verified proofs (3 × −2
+// proof_failure, verified 0), because a wrong taskId corrupts TWO public
+// signals — pub[12] (taskId) and pub[0] = Poseidon(salt, taskId), verified
+// locally 2026-11-16. Two independent agents report keccak256 verified
+// live by the platform (mangkarones, 9/9 practice proofs verified;
+// dyors, same mapping); the platform publishes no encoding, and local
+// Groth16 verification cannot distinguish encodings (the circuit accepts
+// any field element as taskId), so a live round is the only arbiter.
 
 import * as snarkjs from 'snarkjs';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import pkg from 'js-sha3';
+const { keccak256 } = pkg;
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -46,26 +55,24 @@ export function encodeAddress(addr) {
 }
 
 /**
- * taskId → field element. Plan §7.4 best guess (single swappable function):
- * (a) `gk_<decimal>_<suffix>` or bare `gk_<decimal>` (all-decimal middle
- *     segment) → that integer; (b) otherwise SHA-256 of the full task_id
- *     string as a big integer mod p — the plan's §7.4(c) fallback.
- *     Poseidon-of-bytes (§7.4(b)) is NOT used: circomlibjs buildPoseidon
- *     appeared to hang on this VM and the plan explicitly says "do not
- *     use it". A wrong encoding costs the same −2 as an omitted proof,
- *     so this is a free option, not a blocker.
- * Returns { field, encoding } where encoding is 'decimal' | 'sha256'.
+ * taskId → field element: keccak256(utf8(task_id)) mod p (BN128 scalar
+ * field prime). Format-agnostic: applies to every task_id shape the
+ * platform sends (`gk_24_9d1` in the spec examples, `task_R04_<uuid>` in
+ * live R04). Evidence: mangkarones (dev.to, 2026-11-16) — "I mapped it
+ * as keccak256(utf8(task_id)) mod p ... Practice tasks settled it — the
+ * keccak mapping was correct, and every proof verified" (9/9 practice
+ * proofs verified by the platform); dyors (dev.to, 2026-11-16) — "the
+ * task ID [is a] keccak256 value reduced mod the bn128 field prime".
+ * The SHA-256/decimal guess this replaces failed 3/3 live proofs in R04.
+ * NOTE: keccak256 here is the pre-NIST Keccak (js-sha3 / ethers), NOT
+ * NIST SHA3-256 — the two differ. Returns { field, encoding } where
+ * encoding is always 'keccak256'.
  */
 export function encodeTaskId(taskIdString) {
   const s = String(taskIdString ?? '');
-  const m = /^gk_(\d+)(?:_|$)/.exec(s);
-  if (m) {
-    return { field: (BigInt(m[1]) % BN128_PRIME).toString(), encoding: 'decimal' };
-  }
-  const hash = createHash('sha256').update(s, 'utf8').digest();
   return {
-    field: (BigInt('0x' + hash.toString('hex')) % BN128_PRIME).toString(),
-    encoding: 'sha256',
+    field: (BigInt('0x' + keccak256(s)) % BN128_PRIME).toString(),
+    encoding: 'keccak256',
   };
 }
 
