@@ -1,12 +1,10 @@
-# Proof Gatekeeper agent — GROTH16 proof pass (v1.1.0)
+# Dual agent — Proof Gatekeeper (Groth16, v1.1.0) + Steal the VFY (v1.2.0)
 
 Public HTTPS endpoint for zkVerify Agent Games (handle `kixbt`,
 competitionUserId `ac0ceb56-99b8-45a7-8809-6f75f322dfea`,
 wallet `0x5750068fb2e240015993d4d06e4da7dc3ba0100a`).
 
-**Scope of this pass: GROTH16 proofs.** The endpoint, HMAC auth, preflight,
-decision engine (7 trap types) and response signing are complete and
-harness-verified, and every provable task now also carries a Groth16 proof
+**Gatekeeper (v1.1.0, live):** every provable task carries a Groth16 proof
 (`proof` + `public_signals`, 13 elements) generated with snarkjs 0.7.6 and
 the official `gatekeeper.wasm` / `gatekeeper_final.zkey`. Proving is a
 best-effort annotation AFTER the decision is computed and recorded: on any
@@ -14,37 +12,57 @@ proving failure/timeout the response is the exact logic-only response
 (decision + reason_code), which costs the same −2 as an omitted proof and
 never changes the decision. VK_SUBSTITUTION tasks are logic-only by design.
 A correct decision with a valid proof scores the full **+12** plus the
-reliability bonus — see "Scoring note" below. The taskId encoding is the
-plan's §7.4 best guess (see `../groth16-plan.md` §7; single swappable
-`encodeTaskId` in `prove.mjs`).
+reliability bonus. The taskId encoding is the plan's §7.4 best guess
+(see `../groth16-plan.md` §7; single swappable `encodeTaskId` in
+`prove.mjs`).
+
+**Steal the VFY (v1.2.0, NEW):** the same endpoint also serves the
+Steal agent (`kixbt-steal`, agentId `fc9d5827-a30c-4e1a-a7dc-7b16a1267c6e`)
+with the "Optimal Strategy" (see `strategy.mjs`). It routes by envelope
+type, verifies the HMAC with the CORRECT per-event secret
+(`AGENT_GAMES_HMAC_SECRET` for Gatekeeper, `STEAL_HMAC_SECRET` for
+Steal), and enforces agent-match (a task signed with the wrong agent's
+secret is 401). **CIRCUIT-BLOCKER: the vfy-policy proof is NOT yet
+generatable** — the witness fails at template asserts 72/90/149 for
+every input tried (see `prove-steal.mjs` CIRCUIT-BLOCKER and
+`DEPLOY.md`). Until the circuit inputs are resolved, Steal turns
+return HOLD with no proof (fail-closed, -2/turn). The endpoint,
+routing, HMAC, strategy and state are live and correct; only the
+proof is blocked.
 
 Source of truth: `../build-spec.txt` (Builder Field Guide extracted from
-https://agentgames.zkverify.io/build).
+https://agentgames.zkverify.io/build). Deploy: see `DEPLOY.md`.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `server.mjs` | HTTP server, Node 22 + snarkjs. `POST /agent`, `GET /` + `/health`. |
-| `decision.mjs` | Pure decision engine (importable, no I/O). |
-| `prove.mjs` | Groth16 proving (`generateProof`, `encodeTaskId`, `encodeVkHash`). |
-| `circuit/` | Official circuit artifacts: `gatekeeper.wasm`, `gatekeeper_final.zkey`, `vk.json`. |
-| `harness.mjs` | Local test harness — spawns the server, 23 assertions (incl. proof verify + failure injection). |
-| `.env.example` | `AGENT_GAMES_HMAC_SECRET=` + `PORT=3000`. Copy to `.env`. |
+| `server.mjs` | HTTP server, Node 22 + snarkjs. `POST /agent`, `GET /` + `/health`. Dual-mode (Gatekeeper + Steal). |
+| `decision.mjs` | Pure Gatekeeper decision engine (importable, no I/O). |
+| `prove.mjs` | Groth16 proving for Gatekeeper (`generateProof`, `encodeTaskId`, `encodeVkHash`). |
+| `strategy.mjs` | Pure "Optimal Strategy" decision engine for Steal (importable, no I/O). |
+| `prove-steal.mjs` | Groth16 proving for Steal / vfy-policy (`generatePolicyProof`, `encodeStrategyParams`). See CIRCUIT-BLOCKER. |
+| `circuit/` | Official Gatekeeper artifacts: `gatekeeper.wasm`, `gatekeeper_final.zkey`, `vk.json`. |
+| `circuit-steal/` | Official Steal artifacts: `vfy-policy.wasm`, `vfy-policy_final.zkey`, `vk.json`. |
+| `harness.mjs` | Gatekeeper harness — spawns the server, 26 assertions (incl. proof verify + failure injection). |
+| `harness-steal.mjs` | Steal harness — spawns the server, 37 assertions (strategy, routing, HMAC, fail-closed, idempotency). |
+| `DEPLOY.md` | Deploy package (files, env vars, steps, verification, rollback). |
+| `.env.example` | `AGENT_GAMES_HMAC_SECRET=` + `STEAL_HMAC_SECRET=` + `PORT=3000`. Copy to `.env`. |
 | `.gitignore` | `.env`, `state.json`, `node_modules/`. |
-| `state.json` | Created at runtime: `{proofOwners, decisions}` (proof-reuse + replay memory). |
+| `state.json` | Created at runtime: `{proofOwners, decisions, stealMatches}` (reuse + replay memory). |
 
 ## Run
 
 ```bash
-cp .env.example .env        # fill AGENT_GAMES_HMAC_SECRET from the dashboard (Rotate Secret)
+cp .env.example .env        # fill BOTH secrets from the dashboard (Rotate Secret, one per agent)
 PORT=3000 node server.mjs   # listens on $PORT, default 3000
-node harness.mjs            # 19/19 must pass (dummy secret, temp state)
+node harness.mjs            # Gatekeeper: 26/26 must pass (dummy secrets, temp state)
+node harness-steal.mjs      # Steal: 37/37 must pass (dummy secrets, temp state)
 ```
 
-Server refuses to start without `AGENT_GAMES_HMAC_SECRET` (exit 1) —
-a placeholder secret fails preflight, so failing fast is the correct
-behavior (spec §02/§05).
+Server refuses to start without BOTH `AGENT_GAMES_HMAC_SECRET` and
+`STEAL_HMAC_SECRET` (exit 1) — a placeholder secret fails preflight,
+so failing fast is the correct behavior (spec §02/§05/§06).
 
 ## Protocol implemented (exact, from the spec)
 

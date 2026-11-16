@@ -1,34 +1,60 @@
-// server.mjs — Proof Gatekeeper agent (GROTH16 proof pass, v1.1.0).
-// Node 22 + snarkjs 0.7.6. Listens on $PORT (default 3000), handler POST /agent.
+// server.mjs — DUAL agent: Proof Gatekeeper (Groth16, v1.1.0) + Steal the VFY
+// ("Optimal Strategy", v1.0.0). Node 22 + snarkjs 0.7.6.
+// Listens on $PORT (default 3000), handler POST /agent.
 //
-// Protocol (source of truth: ../build-spec.txt, §02; proving plan ../groth16-plan.md):
+// This file is gatekeeper-v2/server.mjs PLUS Steal routing. The Gatekeeper
+// path is preserved EXACTLY (same decision engine, same proving, same
+// state keys, same responses) so its harness still passes 26/26.
+// Steal is additive: a new envelope branch, a second HMAC secret, a
+// second state namespace, and a second circuit.
+//
+// Protocol (source of truth: ../build-spec.txt, §02 Gatekeeper, §06 Steal):
 //   POST /agent
 //   - Every inbound request carries x-agent-games-signature = HMAC-SHA256
-//     (hex) of the RAW request body, keyed by AGENT_GAMES_HMAC_SECRET.
-//     Verify BEFORE parsing JSON; reject on mismatch (401).
+//     (hex) of the RAW request body, keyed by the AGENT's own secret.
+//     Both agents share this endpoint URL, so the HMAC is verified
+//     against BOTH secrets (Gatekeeper first, then Steal); the response
+//     is signed with the secret that verified the request. Verify
+//     BEFORE parsing JSON; reject on mismatch (401).
 //   - Preflight  { "type": "agent-games.preflight.v1", ... }
-//     → { "ok": true, "protocolVersion": "v1" }, signed.
-//   - Task       { "type": "agent-games.proof-gatekeeper.v1", "task_id",
-//                  "mode", "issued_at", "deadline_at", "input": {...} }
-//     → { "decision": "APPROVE"|"REJECT", "reason_code": "...",
-//         "proof_tx": "<echoed when present>",
-//         "proof": "<Groth16 proof>", "public_signals": ["<13 decimal strings>"] }, signed.
-//   - GROTH16: a proof is attached on every provable task (APPROVE and
-//     REJECT). Proving is a BEST-EFFORT annotation AFTER the decision is
-//     computed and recorded: on ANY proving failure/timeout the response is
-//     the exact logic-only response (decision + reason_code), which costs
-//     the same −2 as an omitted proof and never changes the decision.
-//     VK_SUBSTITUTION tasks are logic-only by design (plan §6.2).
-//   - Every response carries x-agent-games-signature over the raw body.
-//   - Fail closed: any error/uncertainty → REJECT, never approve by default.
-//   - 60s hard deadline: decision is synchronous microseconds; proving is
-//     capped at a 10s hard timeout (measured ~1s), leaving 50s headroom.
+//     → { "ok": true, "protocolVersion": "v1" }, signed with the
+//     verifying secret. (The platform preflights each agent separately
+//     with that agent's secret.)
+//   - Gatekeeper { "type": "agent-games.proof-gatekeeper.v1", ... }
+//     → unchanged from v1.1.0 (decision + optional Groth16 proof).
+//   - Steal turn { "eventId": "steal-the-vfy", "mode", "matchId",
+//                  "turn", "issuedAt", "deadlineAt",
+//                  "state": { selfBalance, opponentBalance,
+//                             selfFortifiedUntilTurn,
+//                             opponentFortifiedUntilTurn },
+//                  "strategyCommitment": { "hash" },
+//                  "resolverVersion", "nonce" }
+//     → { "matchId", "turn", "action": { "type", "amount"? },
+//         "policyProof": { "circuitVersion": "v1", "proof",
+//                          "public_signals": ["<9 decimal strings>"] },
+//         "agentTimestamp", "idempotencyKey" }, signed.
+//     action.amount is present ONLY for EXTRACT (schema rejects it for
+//     HOLD/FORTIFY even when 0). policyProof is present ONLY when a
+//     proof was generated; otherwise the response is HOLD with NO
+//     policyProof (fail-closed, -2, resolved as HOLD).
+//     See prove-steal.mjs CIRCUIT-BLOCKER: the vfy-policy witness
+//     currently fails at template asserts 72/90/149 for every input
+//     tried, so proofs are NOT yet generatable and Steal turns fall
+//     back to HOLD. The endpoint, routing, HMAC, strategy and state
+//     are all live and correct; only the proof is blocked.
+//   - Fail closed: any error/uncertainty → Gatekeeper REJECT, Steal HOLD.
+//   - 60s hard deadline: Steal proving is capped at a 10s hard timeout
+//     (measured Gatekeeper ~1s); the decision itself is synchronous.
 //
 // State (state.json next to this file, or $STATE_PATH):
-//   { "proofOwners": { "<proof_tx>": "<task_id>" },
-//     "decisions":   { "<task_id>": { decision, reason_code, proof_tx } } }
-// Same task_id replayed → stored decision is returned verbatim (idempotent).
-// Same proof_tx on a different task_id → PROOF_REUSED.
+//   Gatekeeper (unchanged): { proofOwners: {...}, decisions: {...} }
+//   Steal (new namespace):  { stealMatches: {
+//     "<matchId>": { "<turn>": { action, policyProof?, idempotencyKey,
+//                                agentTimestamp } } } }
+// Same (matchId, turn) replayed → stored response returned verbatim
+// (idempotent). A turn is recorded BEFORE proving (durable even if
+// proving then fails); a proof is only ever attached when it is
+// durably stored.
 
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -37,14 +63,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decide, issuedAtSane } from './decision.mjs';
 import { generateProof } from './prove.mjs';
+import { decideSteal } from './strategy.mjs';
+import { generatePolicyProof } from './prove-steal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
-const SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
+// Two per-event secrets. NEVER hardcode or print either. Both are
+// required: this endpoint serves both agents, and a missing secret
+// would make one agent unverifiable (401 for every request).
+const GK_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
+const STEAL_SECRET = process.env.STEAL_HMAC_SECRET || '';
 const STATE_PATH =
   process.env.STATE_PATH || path.join(__dirname, 'state.json');
 
-if (!SECRET) {
+if (!GK_SECRET) {
   console.error(
     'FATAL: AGENT_GAMES_HMAC_SECRET is not set. ' +
       'Copy it from the platform dashboard (Rotate Secret) and set it in the environment. ' +
@@ -52,12 +84,27 @@ if (!SECRET) {
   );
   process.exit(1);
 }
+if (!STEAL_SECRET) {
+  console.error(
+    'FATAL: STEAL_HMAC_SECRET is not set. ' +
+      'Copy it from the platform dashboard for the kixbt-steal agent ' +
+      '(Rotate Secret) and set it in the environment. ' +
+      'Refusing to start with a placeholder secret (see build-spec §06).',
+  );
+  process.exit(1);
+}
+
+// The registered Steal commitment (vk_hash). A turn whose
+// strategyCommitment.hash differs is answered HOLD (fail-closed);
+// the platform freezes the commitment at pairing.
+const STEAL_COMMITMENT =
+  '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047';
 
 const MAX_BODY = 1_000_000; // 1 MB — envelopes are a few KB
 const PROVE_TIMEOUT_MS = 10_000; // hard proving timeout (plan §6.3)
 
 // ---- state ---------------------------------------------------------------
-let state = { proofOwners: {}, decisions: {} };
+let state = { proofOwners: {}, decisions: {}, stealMatches: {} };
 try {
   const raw = fs.readFileSync(STATE_PATH, 'utf8');
   const parsed = JSON.parse(raw);
@@ -66,6 +113,8 @@ try {
       state.proofOwners = parsed.proofOwners;
     if (parsed.decisions && typeof parsed.decisions === 'object')
       state.decisions = parsed.decisions;
+    if (parsed.stealMatches && typeof parsed.stealMatches === 'object')
+      state.stealMatches = parsed.stealMatches;
   }
 } catch {
   // missing/corrupt state: start empty (fail safe — reuse detection only
@@ -88,11 +137,13 @@ function saveState() {
   }
 }
 
-// In-flight proving promises, keyed by task_id. A replay that arrives
-// while the first request is still proving awaits this promise so it gets
-// the SAME proof-bearing response — never the interim logic-only record
-// (Codex review round 1, MAJOR). The promise always resolves (tryProve
-// never throws; saveState never throws), so awaiting it cannot hang.
+// In-flight proving promises, keyed by task_id (Gatekeeper) and by
+// "steal:<matchId>:<turn>" (Steal). A replay that arrives while the
+// first request is still proving awaits this promise so it gets the
+// SAME proof-bearing response — never the interim logic-only record
+// (Codex review round 1, MAJOR, Gatekeeper). The promise always
+// resolves (tryProve / tryProveSteal never throw; saveState never
+// throws), so awaiting it cannot hang.
 const inflight = new Map();
 
 // ---- HMAC ----------------------------------------------------------------
@@ -112,12 +163,26 @@ function signatureValid(secret, rawBody, header) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// Identify which agent's secret verifies this request. Returns
+// 'gatekeeper' | 'steal' | null. Gatekeeper is tried first (it is the
+// older agent); the two secrets are independent 64-hex strings, so a
+// valid signature matches exactly one of them.
+function verifyAgent(rawBody, header) {
+  if (signatureValid(GK_SECRET, rawBody, header)) return 'gatekeeper';
+  if (signatureValid(STEAL_SECRET, rawBody, header)) return 'steal';
+  return null;
+}
+
+function secretFor(agent) {
+  return agent === 'steal' ? STEAL_SECRET : GK_SECRET;
+}
+
 // ---- helpers ---------------------------------------------------------------
-function sendSigned(res, status, obj) {
+function sendSigned(res, status, obj, secret) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'content-type': 'application/json',
-    'x-agent-games-signature': hmacHex(SECRET, body),
+    'x-agent-games-signature': hmacHex(secret, body),
   });
   res.end(body);
 }
@@ -140,7 +205,7 @@ function readRawBody(req) {
   });
 }
 
-// ---- proving (Groth16, additive + fail-closed) ---------------------------
+// ---- proving (Groth16, Gatekeeper — UNCHANGED from v1.1.0) ---------------
 // tryProve returns { proof, public_signals } or null. Null means
 // "logic-only" — the decision is unchanged. It NEVER throws.
 // Skips proving by design when the proof's VK is missing or substituted
@@ -207,43 +272,96 @@ async function tryProve(input, decision, taskId) {
   }
 }
 
+// ---- proving (Groth16, Steal — best-effort, fail-closed) ------------------
+// tryProveSteal returns { proof, public_signals } or null. Null means
+// "no proof" — the caller returns HOLD. It NEVER throws.
+// CURRENT STATUS (see prove-steal.mjs CIRCUIT-BLOCKER): the vfy-policy
+// witness fails at template asserts 72/90/149 for every input tried,
+// so this returns null on every turn until the circuit inputs are
+// resolved. That is the intended fail-closed behaviour, NOT a bug to
+// work around by patching the wasm or by submitting an unverified proof.
+async function tryProveSteal({ matchId, turn, state: st, action }) {
+  let timer;
+  try {
+    const out = await Promise.race([
+      generatePolicyProof({ matchId, turn, state: st, action })
+        .then((r) => ({ ok: true, ...r }))
+        .catch((e) => ({ ok: false, error: e })),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ ok: false, error: new Error('prove timeout') }),
+          PROVE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (!out || !out.ok) {
+      console.error(
+        `steal prove failed match ${matchId} turn ${turn}: ${out?.error?.message || 'unknown'}`,
+      );
+      return null;
+    }
+    console.log(`steal prove ok match ${matchId} turn ${turn} action=${action.type}`);
+    return { proof: out.proof, public_signals: out.publicSignals };
+  } catch (e) {
+    console.error(`steal prove failed match ${matchId} turn ${turn}: ${e.message}`);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ---- /agent ---------------------------------------------------------------
 async function handleAgent(req, res) {
   let raw;
   try {
     raw = await readRawBody(req);
   } catch (e) {
-    sendSigned(res, 413, { ok: false, error: 'body_too_large' });
+    // No agent identified yet (body unreadable) — sign with the
+    // Gatekeeper secret; the platform treats a 413 as a failure either way.
+    sendSigned(res, 413, { ok: false, error: 'body_too_large' }, GK_SECRET);
     return;
   }
 
   // 1. Verify HMAC over the RAW body BEFORE parsing (spec §02, §05).
-  if (!signatureValid(SECRET, raw, req.headers['x-agent-games-signature'])) {
-    sendSigned(res, 401, { ok: false, error: 'bad_signature' });
+  // Both agents share this endpoint; the request is verified against
+  // the agent's own secret and the response is signed with that secret.
+  const agent = verifyAgent(raw, req.headers['x-agent-games-signature']);
+  if (!agent) {
+    sendSigned(res, 401, { ok: false, error: 'bad_signature' }, GK_SECRET);
     return;
   }
+  const secret = secretFor(agent);
 
   let env;
   try {
     env = JSON.parse(raw.toString('utf8'));
   } catch {
-    sendSigned(res, 400, { ok: false, error: 'invalid_json' });
+    sendSigned(res, 400, { ok: false, error: 'invalid_json' }, secret);
     return;
   }
-  if (!env || typeof env !== 'object' || typeof env.type !== 'string') {
-    sendSigned(res, 400, { ok: false, error: 'missing_type' });
+  if (!env || typeof env !== 'object') {
+    sendSigned(res, 400, { ok: false, error: 'missing_type' }, secret);
     return;
   }
 
   // 2. Preflight — must pass for the platform to mark the agent active.
   // Respond unconditionally after HMAC (never fail preflight on clock skew).
+  // The platform preflights each agent with that agent's secret; the
+  // response is signed with the secret that verified the request.
   if (env.type === 'agent-games.preflight.v1') {
-    sendSigned(res, 200, { ok: true, protocolVersion: 'v1' });
+    sendSigned(res, 200, { ok: true, protocolVersion: 'v1' }, secret);
     return;
   }
 
-  // 3. Gatekeeper task.
+  // 3. Gatekeeper task. (UNCHANGED from v1.1.0, except the agent-match
+  // check below, which is new: a Gatekeeper task must be signed with
+  // the Gatekeeper secret. A task signed with the Steal secret is a
+  // cross-agent error and is rejected, not routed to the Gatekeeper.)
   if (env.type === 'agent-games.proof-gatekeeper.v1') {
+    if (agent !== 'gatekeeper') {
+      sendSigned(res, 401, { ok: false, error: 'bad_agent' }, secret);
+      return;
+    }
     const taskId = typeof env.task_id === 'string' ? env.task_id : '';
 
     // Idempotent replay: same task_id → same stored decision.
@@ -255,13 +373,13 @@ async function handleAgent(req, res) {
       if (pending) {
         try {
           const finalResponse = await pending;
-          sendSigned(res, 200, finalResponse);
+          sendSigned(res, 200, finalResponse, secret);
         } catch {
-          sendSigned(res, 200, state.decisions[taskId]);
+          sendSigned(res, 200, state.decisions[taskId], secret);
         }
         return;
       }
-      sendSigned(res, 200, state.decisions[taskId]);
+      sendSigned(res, 200, state.decisions[taskId], secret);
       return;
     }
 
@@ -351,12 +469,191 @@ async function handleAgent(req, res) {
         inflight.delete(taskId);
       }
     }
-    sendSigned(res, 200, finalResponse);
+    sendSigned(res, 200, finalResponse, secret);
     return;
   }
 
-  // 4. Unknown envelope type → fail closed.
-  sendSigned(res, 400, { ok: false, error: 'unknown_type' });
+  // 4. Steal the VFY turn. Routed by eventId (not by `type`).
+  // Agent-match: a Steal turn must be signed with the Steal secret.
+  // (Codex review round 1, MAJOR: without this, a request signed with
+  // the Gatekeeper secret could retrieve a stored Steal response.)
+  if (env.eventId === 'steal-the-vfy') {
+    if (agent !== 'steal') {
+      sendSigned(res, 401, { ok: false, error: 'bad_agent' }, secret);
+      return;
+    }
+    const matchId = typeof env.matchId === 'string' ? env.matchId : '';
+    // Turn must be a safe integer (Codex review round 3, MINOR): do NOT
+    // Math.trunc it — turn 1.5 would become 1, pass the range check,
+    // and be stored under turn 1, poisoning a later legitimate turn 1.
+    // A fractional/unsafe turn becomes 0, fails the 1..20 check below,
+    // and returns an uncached HOLD.
+    const turnRaw = Number(env.turn);
+    const turn = Number.isSafeInteger(turnRaw) ? turnRaw : 0;
+    const turnKey = String(turn);
+    const inflightKey = `steal:${matchId}:${turnKey}`;
+    const idempotencyKey =
+      typeof env.nonce === 'string' && env.nonce
+        ? env.nonce
+        : `${matchId}:${turnKey}:${Date.now()}`;
+    const agentTimestamp = new Date().toISOString();
+
+    // Validate FIRST, before any replay lookup or persistence.
+    // (Codex review round 1, MAJOR: persisting an invalid turn would
+    // poison the idempotency record for a later legitimate turn.)
+    // Any missing/mismatched required field is treated as HOLD with no
+    // proof (build-spec §06). A wrong strategyCommitment.hash is also
+    // HOLD (the platform freezes the commitment at pairing; a different
+    // hash means this turn is not for our registered strategy).
+    // An invalid turn is returned UNCACHED (never stored), so a later
+    // valid turn for the same (matchId, turn) is processed fresh.
+    const st = env.state && typeof env.state === 'object' ? env.state : null;
+    const commitmentHash =
+      env.strategyCommitment && typeof env.strategyCommitment.hash === 'string'
+        ? env.strategyCommitment.hash.trim().toLowerCase()
+        : '';
+    const toNum = (v) => {
+      if (v === undefined || v === null || v === '') return null;
+      const n = Number(v);
+      // Non-negative SAFE INTEGER, matching decideSteal's accepted domain
+      // (Codex review round 2, MAJOR): a fractional or unsafe-integer
+      // balance must fail validation HERE (uncached HOLD) rather than
+      // reach decideSteal, return HOLD, and get persisted as the turn's
+      // record (which would poison a later legitimate request).
+      if (!Number.isSafeInteger(n) || n < 0) return null;
+      return n;
+    };
+    const usable =
+      !!matchId &&
+      turn >= 1 &&
+      turn <= 20 &&
+      !!st &&
+      toNum(st.selfBalance) !== null &&
+      toNum(st.opponentBalance) !== null &&
+      commitmentHash === STEAL_COMMITMENT.toLowerCase();
+    if (!usable) {
+      sendSigned(
+        res,
+        200,
+        {
+          matchId,
+          turn,
+          action: { type: 'HOLD' },
+          agentTimestamp,
+          idempotencyKey,
+        },
+        secret,
+      );
+      return;
+    }
+
+    // Idempotent replay: same (matchId, turn) → same stored response.
+    // Only valid turns reach here, so a stored record is always a
+    // legitimate turn. If a first request is still proving, await its
+    // final response.
+    if (state.stealMatches[matchId]?.[turnKey]) {
+      const pending = inflight.get(inflightKey);
+      if (pending) {
+        try {
+          const finalResponse = await pending;
+          sendSigned(res, 200, finalResponse, secret);
+        } catch {
+          sendSigned(res, 200, state.stealMatches[matchId][turnKey], secret);
+        }
+        return;
+      }
+      sendSigned(res, 200, state.stealMatches[matchId][turnKey], secret);
+      return;
+    }
+
+    let action = { type: 'HOLD' };
+    try {
+      action = decideSteal(st, turn);
+    } catch {
+      action = { type: 'HOLD' };
+    }
+
+    // Build the response. action.amount is present ONLY for EXTRACT
+    // (schema rejects it for HOLD/FORTIFY even when 0).
+    const response = {
+      matchId,
+      turn,
+      action:
+        action.type === 'EXTRACT'
+          ? { type: 'EXTRACT', amount: action.amount }
+          : { type: action.type },
+      agentTimestamp,
+      idempotencyKey,
+    };
+
+    // Record the turn FIRST (durable even if proving then fails).
+    // A proof is only ever attached when it is durably stored.
+    let persisted = true;
+    if (!state.stealMatches[matchId]) state.stealMatches[matchId] = {};
+    state.stealMatches[matchId][turnKey] = response;
+    persisted = saveState();
+    if (!persisted) {
+      console.error(`steal state save failed match ${matchId} turn ${turn}: proving skipped`);
+    }
+
+    // Proving is a best-effort annotation AFTER the turn is recorded.
+    // On any failure/timeout the response stays HOLD-with-no-proof
+    // (the platform resolves it as HOLD, -2 — never worse than the
+    // no-proof baseline). Proving never changes the action, EXCEPT:
+    // when the proof cannot be generated the response action is HOLD
+    // (fail-closed) rather than the strategy action, because the
+    // platform resolves a proof-less turn as HOLD anyway — declaring
+    // an EXTRACT that will not be applied would be misleading.
+    // When the circuit is resolved and a proof IS generated, the
+    // strategy action is returned WITH the proof.
+    let finalResponse = response;
+    if (persisted) {
+      const provePromise = (async () => {
+        const proved = await tryProveSteal({ matchId, turn, state: st, action });
+        if (proved) {
+          const withProof = {
+            ...response,
+            policyProof: {
+              circuitVersion: 'v1',
+              proof: proved.proof,
+              public_signals: proved.public_signals,
+            },
+          };
+          state.stealMatches[matchId][turnKey] = withProof;
+          if (saveState()) {
+            return withProof;
+          }
+          console.error(
+            `steal prove ok but state save failed match ${matchId} turn ${turn}: sending HOLD, no proof`,
+          );
+          state.stealMatches[matchId][turnKey] = response;
+          return {
+            ...response,
+            action: { type: 'HOLD' },
+          };
+        }
+        // No proof (circuit blocker): fail closed to HOLD, no proof.
+        const holdResponse = {
+          ...response,
+          action: { type: 'HOLD' },
+        };
+        state.stealMatches[matchId][turnKey] = holdResponse;
+        saveState();
+        return holdResponse;
+      })();
+      inflight.set(inflightKey, provePromise);
+      try {
+        finalResponse = await provePromise;
+      } finally {
+        inflight.delete(inflightKey);
+      }
+    }
+    sendSigned(res, 200, finalResponse, secret);
+    return;
+  }
+
+  // 5. Unknown envelope type → fail closed.
+  sendSigned(res, 400, { ok: false, error: 'unknown_type' }, secret);
 }
 
 // ---- server ----------------------------------------------------------------
@@ -368,19 +665,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      sendSigned(res, 200, {
-        ok: true,
-        service: 'proof-gatekeeper',
-        protocolVersion: 'v1',
-        mode: 'groth16',
-      });
+      // Health is public (no HMAC); it only reports liveness + mode.
+      // It is signed with the Gatekeeper secret for consistency with
+      // v1.1.0 (the health response itself carries no sensitive data).
+      sendSigned(
+        res,
+        200,
+        {
+          ok: true,
+          service: 'proof-gatekeeper+steal-the-vfy',
+          protocolVersion: 'v1',
+          mode: 'groth16',
+          steal: 'optimal-strategy-v1',
+        },
+        GK_SECRET,
+      );
       return;
     }
-    sendSigned(res, 404, { ok: false, error: 'not_found' });
+    sendSigned(res, 404, { ok: false, error: 'not_found' }, GK_SECRET);
   } catch (e) {
     // Last-resort fail closed. (Response signing still applies.)
     try {
-      sendSigned(res, 500, { ok: false, error: 'internal_error' });
+      sendSigned(res, 500, { ok: false, error: 'internal_error' }, GK_SECRET);
     } catch {
       res.destroy();
     }
@@ -389,6 +695,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(
-    `gatekeeper listening on :${PORT} (POST /agent) — groth16 proofs on (fail-closed to logic-only)`,
+    `gatekeeper+steal listening on :${PORT} (POST /agent) — groth16 proofs on (fail-closed to logic-only / HOLD-no-proof)`,
   );
 });

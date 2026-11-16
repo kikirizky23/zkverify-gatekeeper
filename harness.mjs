@@ -19,6 +19,7 @@ import * as snarkjs from 'snarkjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 3101;
 const SECRET = 'dummy-test-secret-NEVER-USE-IN-PRODUCTION';
+const STEAL_SECRET = 'dummy-steal-secret-NEVER-USE-IN-PRODUCTION';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-harness-'));
 const STATE_PATH = path.join(TMP, 'state.json');
 // Verification key for the circuit (public protocol artifact).
@@ -136,6 +137,7 @@ async function main() {
       ...process.env,
       PORT: String(PORT),
       AGENT_GAMES_HMAC_SECRET: SECRET,
+      STEAL_HMAC_SECRET: STEAL_SECRET,
       STATE_PATH,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -475,6 +477,7 @@ async function main() {
           ...process.env,
           PORT: String(SAVE_PORT),
           AGENT_GAMES_HMAC_SECRET: SECRET,
+          STEAL_HMAC_SECRET: STEAL_SECRET,
           STATE_PATH: path.join(TMP, 'no-such-dir', 'state.json'),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -528,6 +531,7 @@ async function main() {
           ...process.env,
           PORT: String(FAIL_PORT),
           AGENT_GAMES_HMAC_SECRET: SECRET,
+          STEAL_HMAC_SECRET: STEAL_SECRET,
           STATE_PATH: FAIL_STATE,
           GK_ZKEY_PATH: path.join(TMP, 'nonexistent', 'gatekeeper_final.zkey'),
         },
