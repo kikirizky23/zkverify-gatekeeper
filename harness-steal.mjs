@@ -26,6 +26,7 @@ import {
   encodeMatchId,
   STRATEGY_PARAMS,
   REGISTERED_COMMITMENT,
+  computePublicInputsHash,
 } from './prove-steal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -368,6 +369,7 @@ async function main() {
     j = parse(r);
     let proofOk = false;
     let psOk = false;
+    let hashOk = false;
     if (j?.policyProof?.proof && Array.isArray(j.policyProof.public_signals)) {
       proofOk = await verifyPolicyProof(j.policyProof.proof, j.policyProof.public_signals);
       const ps = j.policyProof.public_signals;
@@ -377,6 +379,19 @@ async function main() {
         ps[3] === '3' && ps[4] === '95' && ps[5] === '105' &&
         ps[6] === '2' && ps[7] === '10' && ps[8] === '1' &&
         j.policyProof.circuitVersion === 'v1';
+      // publicInputsHash: required by the platform's validator (practice
+      // rejects a policyProof without it). Must equal the /build formula
+      // computed from this turn's inputs.
+      const expectedHash = computePublicInputsHash({
+        commitment: ps[1],
+        matchId: env1.matchId,
+        turn: 3,
+        selfBalance: '95',
+        opponentBalance: '105',
+        action: 'EXTRACT',
+        amount: 10,
+      });
+      hashOk = j.policyProof.publicInputsHash === expectedHash;
     }
     check(
       'valid Steal turn → 200 EXTRACT 10 + verifying policyProof, signed (Steal), echoes matchId/turn',
@@ -385,12 +400,12 @@ async function main() {
         j?.turn === 3 &&
         j?.action?.type === 'EXTRACT' &&
         j?.action?.amount === 10 &&
-        proofOk && psOk &&
+        proofOk && psOk && hashOk &&
         typeof j?.idempotencyKey === 'string' &&
         j.idempotencyKey.length > 0 &&
         typeof j?.agentTimestamp === 'string' &&
         sigValid(r, STEAL_SECRET),
-      `status=${r.status} proofOk=${proofOk} psOk=${psOk} body=${r.body.slice(0, 220)}`,
+      `status=${r.status} proofOk=${proofOk} psOk=${psOk} hashOk=${hashOk} body=${r.body.slice(0, 220)}`,
     );
 
     // Replay same (matchId, turn) → identical response (idempotent).

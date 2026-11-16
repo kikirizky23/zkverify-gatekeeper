@@ -64,7 +64,7 @@ import { fileURLToPath } from 'node:url';
 import { decide, issuedAtSane } from './decision.mjs';
 import { generateProof } from './prove.mjs';
 import { decideSteal } from './strategy.mjs';
-import { generatePolicyProof } from './prove-steal.mjs';
+import { generatePolicyProof, computePublicInputsHash } from './prove-steal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -646,6 +646,19 @@ async function handleAgent(req, res) {
               circuitVersion: 'v1',
               proof: proved.proof,
               public_signals: proved.public_signals,
+              // Required by the platform's validator (practice rejects a
+              // policyProof without it, observed 2026-11-16), even though
+              // the build guide calls it an optional audit pointer.
+              // Formula: keccak256 of ABI-packed turn fields (/build).
+              publicInputsHash: computePublicInputsHash({
+                commitment: proved.public_signals[1],
+                matchId,
+                turn,
+                selfBalance: st.selfBalance,
+                opponentBalance: st.opponentBalance,
+                action: action.type,
+                amount: action.type === 'EXTRACT' ? action.amount : 0,
+              }),
             },
           };
           state.stealMatches[matchId][turnKey] = withProof;

@@ -52,7 +52,8 @@
 
 import * as snarkjs from 'snarkjs';
 import { buildPoseidon } from 'circomlibjs';
-import fs from 'node:fs';
+import pkg from 'js-sha3';
+const { keccak256 } = pkg;import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -151,6 +152,50 @@ export async function computeCommitment(strategyParams, salt) {
   const F = poseidon.F;
   const inputs = [...strategyParams, salt].map((x) => BigInt(x));
   return F.toString(poseidon(inputs));
+}
+
+/**
+ * policyProof.publicInputsHash — keccak256 of the ABI-packed turn fields,
+ * each padded to 32 bytes big-endian (platform /build guide, verbatim):
+ *   [commitment, matchId (raw UUID hex, NOT mod p), turn, selfBalance,
+ *    opponentBalance, action code (HOLD 0 / FORTIFY 1 / EXTRACT 2),
+ *    amount (0 for HOLD/FORTIFY), circuitVersion 1]
+ * The guide calls it an OPTIONAL audit pointer "not used for
+ * verification" — but the platform's own practice validator REJECTS a
+ * policyProof without it ("expected string, received undefined",
+ * observed 2026-11-16), so it is required in practice. The commitment
+ * here is the proof's commitment (publicSignals[1], the Poseidon value),
+ * which now equals the registered commitment.
+ */
+export function computePublicInputsHash({
+  commitment,
+  matchId,
+  turn,
+  selfBalance,
+  opponentBalance,
+  action,
+  amount,
+}) {
+  const to32 = (v) => {
+    const b = BigInt(v).toString(16).padStart(64, '0');
+    if (b.length > 64) throw new Error('computePublicInputsHash: value exceeds 32 bytes');
+    return Buffer.from(b, 'hex');
+  };
+  const actionCode = { HOLD: 0n, FORTIFY: 1n, EXTRACT: 2n }[action];
+  if (actionCode === undefined) throw new Error(`computePublicInputsHash: bad action ${action}`);
+  const matchHex = String(matchId ?? '').replace(/-/g, '').trim();
+  if (!/^[0-9a-fA-F]+$/.test(matchHex)) throw new Error(`computePublicInputsHash: bad matchId ${matchId}`);
+  const packed = Buffer.concat([
+    to32(commitment),
+    to32(BigInt('0x' + matchHex)),
+    to32(turn),
+    to32(selfBalance),
+    to32(opponentBalance),
+    to32(actionCode),
+    to32(amount),
+    to32(1n), // circuitVersion "v1" -> 1
+  ]);
+  return '0x' + keccak256(packed);
 }
 
 function requireDecimalString(v, name) {
