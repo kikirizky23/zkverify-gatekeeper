@@ -1,18 +1,17 @@
 // harness-steal.mjs — local test harness for the Steal the VFY branch.
 // Spawns steal-v2/server.mjs on a test port with DUMMY secrets, then:
-//  (A) unit-tests the "Optimal Strategy" (strategy.mjs) decision rules;
+//  (A) unit-tests the "Optimal Strategy" (strategy.mjs) decision rules
+//      — these MUST match the vfy-policy circuit policy exactly
+//      (circuit-steal/WIRING-TRACE.md), or no proof can be generated;
 //  (B) sends signed Steal turn envelopes and asserts the HTTP behaviour
 //      (routing, HMAC, fail-closed HOLD, idempotency, shape);
-//  (C) confirms the vfy-policy proof generation fails (circuit blocker)
-//      and that the server falls back to HOLD with no proof (never a
-//      crash, never a fabricated proof).
+//  (C) confirms the vfy-policy proof generation SUCCEEDS for a valid
+//      turn and the proof VERIFIES against circuit-steal/vk.json.
 // Exit 0 = all pass, 1 = any failure. No network beyond localhost.
 // Usage: node harness-steal.mjs
-// NOTE: because the circuit is BLOCKED (prove-steal.mjs CIRCUIT-BLOCKER),
-// a valid turn is expected to return HOLD with NO policyProof. That is
-// the intended fail-closed behaviour. If the circuit is ever resolved,
-// the "valid turn" expectations below must be updated to expect the
-// strategy action + a verifying proof.
+// NOTE: the circuit is SOLVED (16 Nov 2026). A valid turn returns the
+// strategy action + a verifying policyProof. Invalid turns still fail
+// closed to HOLD with no proof.
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -20,8 +19,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideSteal } from './strategy.mjs';
-import { generatePolicyProof } from './prove-steal.mjs';
+import { decideSteal, POLICY } from './strategy.mjs';
+import {
+  generatePolicyProof,
+  verifyPolicyProof,
+  encodeMatchId,
+  STRATEGY_PARAMS,
+} from './prove-steal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 3105;
@@ -109,9 +113,10 @@ function turnEnv(overrides = {}) {
 }
 
 async function main() {
-  // ---- (A) strategy unit tests -------------------------------------------
+  // ---- (A) strategy unit tests (circuit policy, WIRING-TRACE.md) --------
+  // Policy: self < 30 -> FORTIFY; else opp > 0 -> EXTRACT 10; else HOLD.
   check(
-    'strategy: early turn, opp not fortified → EXTRACT 10',
+    'strategy: early turn, 95/105 → EXTRACT 10',
     JSON.stringify(decideSteal({ selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 3)) ===
       JSON.stringify({ type: 'EXTRACT', amount: 10 }),
   );
@@ -120,39 +125,58 @@ async function main() {
     decideSteal({ selfBalance: '100', opponentBalance: '0', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5).type === 'HOLD',
   );
   check(
-    'strategy: opp fortified + low balance (5) → extract gain 0, ahead → FORTIFY',
-    decideSteal({ selfBalance: '120', opponentBalance: '5', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: 5 }, 5).type === 'FORTIFY',
+    'strategy: self low (25/105) → FORTIFY',
+    decideSteal({ selfBalance: '25', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5).type === 'FORTIFY',
   );
   check(
-    'strategy: opp fortified + low balance (5), behind → HOLD',
-    decideSteal({ selfBalance: '3', opponentBalance: '5', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: 5 }, 5).type === 'HOLD',
+    'strategy: self low (3/5), behind → FORTIFY (self-balance rule, opp irrelevant)',
+    decideSteal({ selfBalance: '3', opponentBalance: '5', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: 5 }, 5).type === 'FORTIFY',
   );
   check(
-    'strategy: late turn 19, ahead → FORTIFY',
-    decideSteal({ selfBalance: '130', opponentBalance: '90', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 19).type === 'FORTIFY',
-  );
-  check(
-    'strategy: late turn 19, behind → EXTRACT 10',
-    JSON.stringify(decideSteal({ selfBalance: '90', opponentBalance: '130', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 19)) ===
+    'strategy: self at boundary 30/105 → EXTRACT 10 (30 is NOT < 30)',
+    JSON.stringify(decideSteal({ selfBalance: '30', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5)) ===
       JSON.stringify({ type: 'EXTRACT', amount: 10 }),
   );
   check(
-    'strategy: mid game, ahead by 25 (turn 12) → FORTIFY',
-    decideSteal({ selfBalance: '125', opponentBalance: '100', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 12).type === 'FORTIFY',
+    'strategy: self 29/105 → FORTIFY (29 < 30)',
+    decideSteal({ selfBalance: '29', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5).type === 'FORTIFY',
   );
   check(
-    'strategy: EXTRACT amount capped by opp balance (opp 4) → EXTRACT 4',
+    'strategy: self low + opp broke (25/0) → FORTIFY (circuit fortifies on self alone)',
+    decideSteal({ selfBalance: '25', opponentBalance: '0', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5).type === 'FORTIFY',
+  );
+  check(
+    'strategy: opp 4 → EXTRACT 10 (amount is the fixed sp0, NOT capped by opp balance)',
     JSON.stringify(decideSteal({ selfBalance: '95', opponentBalance: '4', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 3)) ===
-      JSON.stringify({ type: 'EXTRACT', amount: 4 }),
+      JSON.stringify({ type: 'EXTRACT', amount: 10 }),
   );
   check(
-    'strategy: opp fortified, opp 105 → EXTRACT 10 (gain 4, still best)',
+    'strategy: opp fortified (105, fortified turn 3) → EXTRACT 10 (fortification is NOT a circuit policy input)',
     JSON.stringify(decideSteal({ selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: 3 }, 3)) ===
       JSON.stringify({ type: 'EXTRACT', amount: 10 }),
   );
   check(
+    'strategy: late turn 19, ahead (130/90) → EXTRACT 10 (turn is NOT a circuit policy input)',
+    JSON.stringify(decideSteal({ selfBalance: '130', opponentBalance: '90', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 19)) ===
+      JSON.stringify({ type: 'EXTRACT', amount: 10 }),
+  );
+  check(
+    'strategy: late turn 19, behind (90/130) → EXTRACT 10',
+    JSON.stringify(decideSteal({ selfBalance: '90', opponentBalance: '130', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 19)) ===
+      JSON.stringify({ type: 'EXTRACT', amount: 10 }),
+  );
+  check(
     'strategy: HOLD/FORTIFY carry no amount field',
-    !('amount' in decideSteal({ selfBalance: '100', opponentBalance: '0', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5)),
+    !('amount' in decideSteal({ selfBalance: '100', opponentBalance: '0', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5)) &&
+    !('amount' in decideSteal({ selfBalance: '25', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 5)),
+  );
+  check(
+    'strategy: POLICY thresholds match prove-steal STRATEGY_PARAMS',
+    POLICY.extractAmount === Number(STRATEGY_PARAMS[0]) &&
+    POLICY.fortifyBelow === Number(STRATEGY_PARAMS[1]) &&
+    POLICY.extractAbove === Number(STRATEGY_PARAMS[2]) &&
+    STRATEGY_PARAMS[3] === '0' &&
+    STRATEGY_PARAMS.slice(4).every((x) => x === '0'),
   );
   check(
     'strategy: fractional balance (95.5) → HOLD (safe-integer domain)',
@@ -172,23 +196,99 @@ async function main() {
     decideSteal({ selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null }, 21).type === 'HOLD',
   );
 
-  // ---- (C) proof generation fails (circuit blocker) ----------------------
-  let proveErr = '';
+  // ---- (C) proof generation SUCCEEDS + verifies (circuit SOLVED) ---------
+  let proved = null;
+  try {
+    proved = await generatePolicyProof({
+      matchId: '9f4e1b2a-1111-4222-8333-444455556666',
+      turn: 3,
+      state: { selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'EXTRACT', amount: 10 },
+    });
+    check('prove-steal: generates a proof for a valid EXTRACT turn', !!proved?.proof && Array.isArray(proved?.publicSignals) && proved.publicSignals.length === 9);
+  } catch (e) {
+    check('prove-steal: generates a proof for a valid EXTRACT turn', false, String(e.message || e).slice(0, 200));
+  }
+  if (proved) {
+    const ok = await verifyPolicyProof(proved.proof, proved.publicSignals);
+    check('prove-steal: proof VERIFIES against circuit-steal/vk.json (groth16.verify=true)', ok === true);
+    const ps = proved.publicSignals;
+    check(
+      'prove-steal: public signals match the turn (matchId/turn/balances/action/amount/version)',
+      ps[2] === encodeMatchId('9f4e1b2a-1111-4222-8333-444455556666') &&
+      ps[3] === '3' && ps[4] === '95' && ps[5] === '105' &&
+      ps[6] === '2' && ps[7] === '10' && ps[8] === '1',
+      `ps=${JSON.stringify(ps)}`,
+    );
+  } else {
+    check('prove-steal: proof VERIFIES against circuit-steal/vk.json', false, 'no proof generated');
+    check('prove-steal: public signals match the turn', false, 'no proof generated');
+  }
+  // FORTIFY turn also proves (self < 30).
+  try {
+    const fort = await generatePolicyProof({
+      matchId: '9f4e1b2a-1111-4222-8333-444455556666',
+      turn: 4,
+      state: { selfBalance: '25', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'FORTIFY' },
+    });
+    const ok = await verifyPolicyProof(fort.proof, fort.publicSignals);
+    check('prove-steal: FORTIFY turn proof verifies', ok === true && fort.publicSignals[6] === '1' && fort.publicSignals[7] === '0');
+  } catch (e) {
+    check('prove-steal: FORTIFY turn proof verifies', false, String(e.message || e).slice(0, 200));
+  }
+  // HOLD turn also proves (opp 0).
+  try {
+    const hold = await generatePolicyProof({
+      matchId: '9f4e1b2a-1111-4222-8333-444455556666',
+      turn: 5,
+      state: { selfBalance: '100', opponentBalance: '0', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'HOLD' },
+    });
+    const ok = await verifyPolicyProof(hold.proof, hold.publicSignals);
+    check('prove-steal: HOLD turn proof verifies', ok === true && hold.publicSignals[6] === '0' && hold.publicSignals[7] === '0');
+  } catch (e) {
+    check('prove-steal: HOLD turn proof verifies', false, String(e.message || e).slice(0, 200));
+  }
+  // A WRONG action (not the circuit-computed one) must still fail:
+  // EXTRACT when the circuit computes FORTIFY (self 25 < 30).
+  // It now throws a clear "policy mismatch" error (defense-in-depth
+  // validation in generatePolicyProof) instead of a circuit assert.
+  try {
+    await generatePolicyProof({
+      matchId: '9f4e1b2a-1111-4222-8333-444455556666',
+      turn: 6,
+      state: { selfBalance: '25', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'EXTRACT', amount: 10 },
+    });
+    check('prove-steal: wrong action (EXTRACT when circuit says FORTIFY) throws', false, 'unexpectedly succeeded');
+  } catch (e) {
+    check('prove-steal: wrong action (EXTRACT when circuit says FORTIFY) throws', /policy mismatch/.test(String(e.message || e)), String(e.message || e).slice(0, 120));
+  }
+  // Invalid inputs are rejected explicitly (Codex review round 2, MINOR):
+  // turn 0 + HOLD must throw a validation error, NOT pass the comparison
+  // and fail at the circuit assert.
+  try {
+    await generatePolicyProof({
+      matchId: '9f4e1b2a-1111-4222-8333-444455556666',
+      turn: 0,
+      state: { selfBalance: '0', opponentBalance: '1', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'HOLD' },
+    });
+    check('prove-steal: turn 0 + HOLD throws a validation error', false, 'unexpectedly succeeded');
+  } catch (e) {
+    check('prove-steal: turn 0 + HOLD throws a validation error', /turn out of range/.test(String(e.message || e)), String(e.message || e).slice(0, 120));
+  }
   try {
     await generatePolicyProof({
       matchId: '9f4e1b2a-1111-4222-8333-444455556666',
       turn: 3,
-      state: { selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
-      action: { type: 'EXTRACT', amount: 5 },
+      state: { selfBalance: '95.5', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+      action: { type: 'HOLD' },
     });
-    check('prove-steal: expected to throw (circuit blocker)', false, 'unexpectedly succeeded');
+    check('prove-steal: fractional balance throws a validation error', false, 'unexpectedly succeeded');
   } catch (e) {
-    proveErr = String(e.message || e);
-    check(
-      'prove-steal: throws at template assert (circuit blocker, expected)',
-      /Assert Failed.*line: 72/.test(proveErr),
-      proveErr.slice(0, 120),
-    );
+    check('prove-steal: fractional balance throws a validation error', /invalid input selfBalance/.test(String(e.message || e)), String(e.message || e).slice(0, 120));
   }
 
   // ---- (B) HTTP endpoint tests -------------------------------------------
@@ -248,25 +348,37 @@ async function main() {
     r = await request({ body: { type: 'agent-games.preflight.v1' }, sign: false });
     check('preflight missing signature → 401', r.status === 401, `status=${r.status}`);
 
-    // Valid Steal turn (EXTRACT scenario) → 200, HOLD + NO proof
-    // (circuit blocker: fail-closed), no amount field, signed with
-    // the Steal secret, echoes matchId/turn, has idempotencyKey.
+    // Valid Steal turn (EXTRACT scenario, 95/105) → 200, EXTRACT 10 +
+    // a VERIFYING policyProof, signed with the Steal secret, echoes
+    // matchId/turn, has idempotencyKey.
     const env1 = turnEnv();
     r = await request({ body: env1, secret: STEAL_SECRET });
     j = parse(r);
+    let proofOk = false;
+    let psOk = false;
+    if (j?.policyProof?.proof && Array.isArray(j.policyProof.public_signals)) {
+      proofOk = await verifyPolicyProof(j.policyProof.proof, j.policyProof.public_signals);
+      const ps = j.policyProof.public_signals;
+      psOk =
+        ps.length === 9 &&
+        ps[2] === encodeMatchId(env1.matchId) &&
+        ps[3] === '3' && ps[4] === '95' && ps[5] === '105' &&
+        ps[6] === '2' && ps[7] === '10' && ps[8] === '1' &&
+        j.policyProof.circuitVersion === 'v1';
+    }
     check(
-      'valid Steal turn → 200 HOLD, no policyProof, no amount, signed (Steal), echoes matchId/turn',
+      'valid Steal turn → 200 EXTRACT 10 + verifying policyProof, signed (Steal), echoes matchId/turn',
       r.status === 200 &&
         j?.matchId === env1.matchId &&
         j?.turn === 3 &&
-        j?.action?.type === 'HOLD' &&
-        !('amount' in (j?.action || {})) &&
-        !('policyProof' in j) &&
+        j?.action?.type === 'EXTRACT' &&
+        j?.action?.amount === 10 &&
+        proofOk && psOk &&
         typeof j?.idempotencyKey === 'string' &&
         j.idempotencyKey.length > 0 &&
         typeof j?.agentTimestamp === 'string' &&
         sigValid(r, STEAL_SECRET),
-      `status=${r.status} body=${r.body.slice(0, 220)}`,
+      `status=${r.status} proofOk=${proofOk} psOk=${psOk} body=${r.body.slice(0, 220)}`,
     );
 
     // Replay same (matchId, turn) → identical response (idempotent).
@@ -380,7 +492,8 @@ async function main() {
     const fracTurnOk =
       r.status === 200 && j?.action?.type === 'HOLD' && !('policyProof' in j);
     // Now the legitimate turn 1 for the same match must be processed
-    // fresh (its own nonce in the response), not replayed.
+    // fresh (its own nonce in the response) with its strategy action
+    // (95/105 → EXTRACT 10) + a verifying proof.
     r = await request({
       body: turnEnv({
         matchId: '9f4e1b2a-bbbb-4222-8333-444455556666',
@@ -390,16 +503,21 @@ async function main() {
       secret: STEAL_SECRET,
     });
     j = parse(r);
+    let legitProofOk = false;
+    if (j?.policyProof?.proof && Array.isArray(j.policyProof.public_signals)) {
+      legitProofOk = await verifyPolicyProof(j.policyProof.proof, j.policyProof.public_signals);
+    }
     const legitTurnOk =
       r.status === 200 &&
       j?.turn === 1 &&
-      j?.action?.type === 'HOLD' &&
+      j?.action?.type === 'EXTRACT' &&
+      j?.action?.amount === 10 &&
       j?.idempotencyKey === 'legit-nonce-1' &&
-      !('policyProof' in j);
+      legitProofOk;
     check(
-      'fractional turn 1.5 → uncached HOLD; legitimate turn 1 after it → processed fresh (own nonce)',
+      'fractional turn 1.5 → uncached HOLD; legitimate turn 1 after it → EXTRACT 10 + verifying proof (own nonce)',
       fracTurnOk && legitTurnOk,
-      `frac=${fracTurnOk} legit=${legitTurnOk} key=${j?.idempotencyKey}`,
+      `frac=${fracTurnOk} legit=${legitTurnOk} key=${j?.idempotencyKey} proofOk=${legitProofOk}`,
     );
 
     // Cross-agent: a Steal turn signed with the Gatekeeper secret → 401.
@@ -419,13 +537,19 @@ async function main() {
     r = await request({ body: badEnv, secret: STEAL_SECRET });
     const badOk = r.status === 200 && parse(r)?.action?.type === 'HOLD';
     r = await request({ body: turnEnv({ matchId: poisonId }), secret: STEAL_SECRET });
+    const goodJ = parse(r);
+    let goodProofOk = false;
+    if (goodJ?.policyProof?.proof && Array.isArray(goodJ.policyProof.public_signals)) {
+      goodProofOk = await verifyPolicyProof(goodJ.policyProof.proof, goodJ.policyProof.public_signals);
+    }
     const goodOk =
       r.status === 200 &&
-      parse(r)?.action?.type === 'HOLD' &&
-      !('policyProof' in (parse(r) || {})) &&
+      goodJ?.action?.type === 'EXTRACT' &&
+      goodJ?.action?.amount === 10 &&
+      goodProofOk &&
       sigValid(r, STEAL_SECRET);
     check(
-      'invalid turn then valid turn (same matchId/turn) → valid turn processed, not poisoned',
+      'invalid turn then valid turn (same matchId/turn) → valid turn processed (EXTRACT 10 + proof), not poisoned',
       badOk && goodOk,
       `bad=${badOk} good=${goodOk}`,
     );
@@ -445,11 +569,22 @@ async function main() {
       const hasInvalid4444 = ids.includes('9f4e1b2a-4444-4222-8333-444455556666');
       const hasInvalid8888 = ids.includes('9f4e1b2a-8888-4222-8333-444455556666');
       const hasInvalidAaaa = ids.includes('9f4e1b2a-aaaa-4222-8333-444455556666');
+      // Valid stored turns must carry a verifying proof.
+      let storedProofsOk = true;
+      for (const id of ['9f4e1b2a-1111-4222-8333-444455556666', '9f4e1b2a-2222-4222-8333-444455556666', '9f4e1b2a-9999-4222-8333-444455556666', '9f4e1b2a-bbbb-4222-8333-444455556666']) {
+        const turns = saved.stealMatches[id] || {};
+        for (const tk of Object.keys(turns)) {
+          const rec = turns[tk];
+          if (!rec.policyProof?.proof || !Array.isArray(rec.policyProof.public_signals)) { storedProofsOk = false; break; }
+          if (!(await verifyPolicyProof(rec.policyProof.proof, rec.policyProof.public_signals))) { storedProofsOk = false; break; }
+        }
+      }
       check(
-        'state.json persisted ONLY valid stealMatches (invalid turns not stored)',
+        'state.json persisted ONLY valid stealMatches (invalid turns not stored) + stored turns carry verifying proofs',
         ids.length === 4 && hasValid1111 && hasValid2222 && hasValid9999 && hasValidBbbb &&
-          !hasInvalid3333 && !hasInvalid4444 && !hasInvalid8888 && !hasInvalidAaaa,
-        `matches=${ids.join(',')}`,
+          !hasInvalid3333 && !hasInvalid4444 && !hasInvalid8888 && !hasInvalidAaaa &&
+          storedProofsOk,
+        `matches=${ids.join(',')} storedProofsOk=${storedProofsOk}`,
       );
     } catch (e) {
       check('state.json persisted ONLY valid stealMatches', false, e.message);

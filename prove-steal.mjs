@@ -2,63 +2,57 @@
 // Pure proving: no HTTP, no decision logic. On ANY failure it throws and
 // the caller (server.mjs) falls back to HOLD with no proof (fail-closed).
 //
-// Circuit inputs (17, recovered by FNV-1a probe + witness-layout check):
+// Circuit inputs (17, recovered + verified by witness/proof experiment):
 //   PUBLIC (8): commitment, matchId, turnNumber, selfBalance,
 //     opponentBalance, action, amount, circuitVersion.
 //   PRIVATE (9): strategyParams[8], salt.
-// Public signals (9, output-then-public order, confirmed via patched
-// witness): [wire1, commitment, matchId, turnNumber, selfBalance,
+// Public signals (9, output-then-public order, confirmed via a verifying
+// proof): [wire1, commitment, matchId, turnNumber, selfBalance,
 //   opponentBalance, action, amount, circuitVersion].
-//   wire1 is a computed internal output (its exact expression is
-//   UNRESOLVED — see CIRCUIT-BLOCKER below).
+//   wire1 = Poseidon_153(matchId, turnNumber, circuitVersion) (public
+//   output); commitment = Poseidon_73(strategyParams[0..7], salt).
 //
 // Registered commitment (vk_hash, /api/circuit-info + GET commitment):
 //   0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047
 //   (commitmentHash == vfyPolicy vkHash; strategy "Optimal Strategy").
+//   NOTE: the vk_hash is the REGISTERED circuit identity (checked by the
+//   server against the envelope's strategyCommitment.hash). It is NOT the
+//   circuit's `commitment` input — that input is Poseidon(strategyParams,
+//   salt), a per-proof binding of the policy params. The old code set
+//   commitment = encodeVkHash(vk_hash), which is WRONG (fails L72).
 //
-// ---- CIRCUIT-BLOCKER (status 16 Nov 2026, MUST READ) --------------------
-// The witness calculation on the UNPATCHED wasm fails at exactly THREE
-// asserts in template VfyPolicyProof_154 (lines 72, 90, 149). All other
-// template-154 asserts pass, so the range checks are fine — only these
-// three policy/equality asserts fail. Two Codex WAT analyses (logs:
-// circuit-steal/codex-assert.log, codex-assert2.log) could NOT identify
-// the satisfying inputs: the .sym/.r1cs/circuit source are NOT served
-// (404), so the component wiring cannot be mapped to signal names.
-// With the CORRECTED function-index mapping (imports 0-3, defined fns
-// from 4; call 52=Fr_eq, call 39=Fr_isTrue, call 49=Fr_sub,
-// call 58=Fr_mul), the three asserts are EQUALITY checks:
-//   line 72:  component[1].signal[1] == commitment
-//   line 90:  component[0].signal[0] == matchId
-//   line 149: component[7].signal[1] *
-//             (component[18].signal[0] - component[7].signal[0])
-//             == component[24].signal[0]
-// The component identities (which sub-component is 0/1/7/18/24) and
-// what strategyParams[8] encodes are UNRESOLVED. strategyParams[4],
-// [6], [7] do not appear in the witness at all; strategyParams[5] is
-// at witness[1271]. No Poseidon hash of any raw-input combination
-// appears anywhere in the 1909-signal witness.
-// CONSEQUENCE: generatePolicyProof() currently THROWS for every input
-// (witness assert). The server treats that as "no proof" and returns
-// HOLD (fail-closed, -2/turn, resolved as HOLD) — the agent stays
-// registered and responsive, but it cannot score a verified turn until
-// the circuit inputs are resolved. Resolution paths: (a) obtain the
-// circuit source / .sym / .r1cs from the zkVerify team, or (b) trace
-// the full component wiring in VfyPolicyProof_154_create/_run.
-// DO NOT "fix" this by patching the wasm or by submitting a proof
-// from the patched wasm — a patched-wasm proof would NOT verify
-// against the platform's real VK and would be a false submission.
+// ---- CIRCUIT — SOLVED 16 Nov 2026 (see circuit-steal/WIRING-TRACE.md) ----
+// The witness calculation on the UNPATCHED wasm used to fail at exactly
+// THREE asserts in template VfyPolicyProof_154 (lines 72, 90, 149). The
+// full component wiring was traced from the WAT disassembly
+// (VfyPolicyProof_154_create/_run; 11 sub-components) and every assert
+// decoded. Verified end-to-end: a witness + Groth16 proof generated with
+// the UNPATCHED wasm + zkey verifies (`groth16.verify = true`) against
+// circuit-steal/vk.json (probe: circuit-steal/prove_full.mjs).
 //
-// Strategy-params encoding below (encodeStrategyParams) is a BEST GUESS
-// (fortify state in slots 0-1, rest 0), single swappable function.
-// A wrong encoding costs the same -2 as an omitted proof (free option);
-// a right one gains a verified turn. It is NOT claimed to be correct.
+// Policy (the circuit COMPUTES the action from balances + params):
+//   sp0 = EXTRACT amount, must be in [1,10] (L90: sp0>=1, L95: sp0<=10).
+//   sp1 = "low balance" threshold: selfBalance < sp1 -> FORTIFY (L140).
+//   sp2 = "rich opponent" threshold: opponentBalance > sp2 (and not low
+//         and sp3==0) -> EXTRACT (L140).
+//   sp3 = extract-enable flag, must be 0 or 1 (L98); 0 = EXTRACT allowed.
+//   sp4..sp7 = 0 (L75-78).
+//   L149: action==EXTRACT -> amount must equal sp0.
+//   L153: action!=EXTRACT -> amount must be 0.
+//   L72: commitment == Poseidon_73(sp0..sp7, salt) (circomlibjs Poseidon).
+// The decision engine (strategy.mjs::decideSteal) MUST implement exactly
+// this policy, or L140 fails and no proof is generated.
+// DO NOT "fix" anything by patching the wasm — proofs must come from the
+// unpatched wasm + zkey only.
 
 import * as snarkjs from 'snarkjs';
+import { buildPoseidon } from 'circomlibjs';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { decideSteal } from './strategy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -96,26 +90,47 @@ export const ACTION_CODE = { HOLD: 0, FORTIFY: 1, EXTRACT: 2 };
 export const CIRCUIT_VERSION_FIELD = '1';
 
 /**
- * strategyParams[8] — BEST GUESS (UNVERIFIED, see CIRCUIT-BLOCKER above).
- * Single swappable function. Current guess: the fortify state, which is
- * in the turn envelope but in NONE of the 8 public inputs, so it must
- * reach the circuit through a private input. Slots 0-1 carry it
- * (0 = not fortified); slots 2-7 are 0 (reserved for strategy
- * thresholds). If the circuit is resolved and this encoding is wrong,
- * replace this function only — nothing else changes.
+ * strategyParams[8] — the FIXED "Optimal Strategy v1" policy, verified
+ * against the unpatched circuit (see WIRING-TRACE.md). Single source of
+ * truth for the policy thresholds; strategy.mjs::decideSteal MUST
+ * implement exactly the same policy, or the circuit's L140 assert
+ * (action == computed action) fails and no proof is generated.
+ *
+ *   sp0 = 10  EXTRACT amount (circuit range [1,10]; 10 = max gain).
+ *   sp1 = 30  FORTIFY when selfBalance < 30 (protect when low).
+ *   sp2 = 0   EXTRACT when opponentBalance > 0 (any balance worth taking).
+ *   sp3 = 0   EXTRACT enabled (1 would block EXTRACT).
+ *   sp4..sp7 = 0 (required by the circuit, L75-78).
+ *
+ * The params are FIXED for the agent (they are the committed policy).
+ * They do not depend on the turn state — the circuit computes the action
+ * from these thresholds + the balances. The fortify-turn fields in the
+ * envelope state are NOT policy inputs to this circuit.
  */
-export function encodeStrategyParams(state) {
-  const s = state && typeof state === 'object' ? state : {};
-  const fort = (v) => {
-    if (v === null || v === undefined || v === '') return '0';
-    const n = Number(v);
-    return Number.isFinite(n) && n >= 0 ? String(Math.trunc(n)) : '0';
-  };
-  return [
-    fort(s.selfFortifiedUntilTurn),
-    fort(s.opponentFortifiedUntilTurn),
-    '0', '0', '0', '0', '0', '0',
-  ];
+export const STRATEGY_PARAMS = ['10', '30', '0', '0', '0', '0', '0', '0'];
+
+export function encodeStrategyParams(/* state — ignored: policy is fixed */) {
+  return [...STRATEGY_PARAMS];
+}
+
+// Lazily-built Poseidon (circomlibjs); the circuit's Poseidon_73 is the
+// standard circomlibjs Poseidon (verified byte-identical, WIRING-TRACE.md).
+let poseidonPromise = null;
+function getPoseidon() {
+  if (!poseidonPromise) poseidonPromise = buildPoseidon();
+  return poseidonPromise;
+}
+
+/**
+ * commitment = Poseidon_73(strategyParams[0..7], salt), as a decimal
+ * string. This is the circuit's `commitment` public input (L72) — NOT
+ * the vk_hash. The vk_hash is only the registered circuit identity.
+ */
+export async function computeCommitment(strategyParams, salt) {
+  const poseidon = await getPoseidon();
+  const F = poseidon.F;
+  const inputs = [...strategyParams, salt].map((x) => BigInt(x));
+  return F.toString(poseidon(inputs));
 }
 
 function requireDecimalString(v, name) {
@@ -132,11 +147,16 @@ function requireDecimalString(v, name) {
  * @param {object} args - { matchId, turn, state, action }
  *   action: { type: 'HOLD'|'FORTIFY'|'EXTRACT', amount?: number }
  *   (amount is 0 for HOLD/FORTIFY; for EXTRACT it is 1..10.)
+ *   The action MUST be the one decideSteal returns for this state —
+ *   the circuit recomputes the action from the policy thresholds +
+ *   balances (L140) and the proof fails otherwise. This is enforced
+ *   below (Codex review, MAJOR): a mismatched action throws a clear
+ *   "policy mismatch" error instead of a cryptic circuit assert.
  * @returns {Promise<{proof, publicSignals}>} — publicSignals has 9
  *   decimal strings in output-then-public order.
- * @throws on ANY failure (bad input, missing circuit file, witness
- *   assert at template lines 72/90/149, prove error). Caller must
- *   fall back to HOLD with no proof. NEVER returns a partial proof.
+ * @throws on ANY failure (bad input, policy mismatch, missing circuit
+ *   file, witness assert, prove error). Caller must fall back to HOLD
+ *   with no proof. NEVER returns a partial proof.
  */
 export async function generatePolicyProof(args) {
   const a = args && typeof args === 'object' ? args : {};
@@ -146,6 +166,40 @@ export async function generatePolicyProof(args) {
   const actionType = a.action && a.action.type;
   if (actionType !== 'HOLD' && actionType !== 'FORTIFY' && actionType !== 'EXTRACT') {
     throw new Error(`prove-steal: bad action ${actionType}`);
+  }
+  // Defense-in-depth (Codex review, MAJOR): the action must be exactly
+  // what decideSteal computes for this state/turn, or the circuit's
+  // L140 assert (action == computed action) fails. Reject a mismatch
+  // here with a clear error instead of letting the witness throw.
+  // Validate turn/balances FIRST (Codex review round 2, MINOR):
+  // decideSteal maps invalid inputs to a fallback HOLD, which would
+  // pass the comparison below and reach the witness only to fail at
+  // L140 (e.g. turn 0 + HOLD: the circuit computes FORTIFY for
+  // selfBalance 0 < 30). Reject invalid inputs explicitly instead.
+  const validNum = (v, name) => {
+    if (v === undefined || v === null || v === '') {
+      throw new Error(`prove-steal: missing input ${name}`);
+    }
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new Error(`prove-steal: invalid input ${name}: ${String(v)}`);
+    }
+    return n;
+  };
+  const turnNum = validNum(a.turn, 'turn');
+  if (turnNum < 1 || turnNum > 20) {
+    throw new Error(`prove-steal: turn out of range: ${turnNum}`);
+  }
+  validNum(a.state?.selfBalance, 'selfBalance');
+  validNum(a.state?.opponentBalance, 'opponentBalance');
+  const expected = decideSteal(a.state, a.turn);
+  const actionMatches =
+    expected.type === actionType &&
+    (actionType !== 'EXTRACT' || String(expected.amount) === String(a.action.amount));
+  if (!actionMatches) {
+    throw new Error(
+      `prove-steal: policy mismatch — decideSteal says ${expected.type}${expected.amount !== undefined ? ` ${expected.amount}` : ''}, got ${actionType}${a.action.amount !== undefined ? ` ${a.action.amount}` : ''}`,
+    );
   }
   const amount =
     actionType === 'EXTRACT'
@@ -162,8 +216,12 @@ export async function generatePolicyProof(args) {
     BigInt('0x' + randomBytes(31).toString('hex')) % BN128_PRIME
   ).toString();
 
+  // Fixed policy params + Poseidon commitment (circuit L72).
+  const strategyParams = encodeStrategyParams(a.state);
+  const commitment = await computeCommitment(strategyParams, salt);
+
   const input = {
-    commitment: encodeVkHash(VFY_VK_HASH),
+    commitment,
     matchId: encodeMatchId(a.matchId),
     turnNumber: requireDecimalString(a.turn, 'turn'),
     selfBalance: requireDecimalString(a.state?.selfBalance, 'selfBalance'),
@@ -171,7 +229,7 @@ export async function generatePolicyProof(args) {
     action: String(ACTION_CODE[actionType]),
     amount,
     circuitVersion: CIRCUIT_VERSION_FIELD,
-    strategyParams: encodeStrategyParams(a.state),
+    strategyParams,
     salt,
   };
 

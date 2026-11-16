@@ -37,11 +37,11 @@
 //     HOLD/FORTIFY even when 0). policyProof is present ONLY when a
 //     proof was generated; otherwise the response is HOLD with NO
 //     policyProof (fail-closed, -2, resolved as HOLD).
-//     See prove-steal.mjs CIRCUIT-BLOCKER: the vfy-policy witness
-//     currently fails at template asserts 72/90/149 for every input
-//     tried, so proofs are NOT yet generatable and Steal turns fall
-//     back to HOLD. The endpoint, routing, HMAC, strategy and state
-//     are all live and correct; only the proof is blocked.
+//     The vfy-policy circuit is SOLVED (circuit-steal/WIRING-TRACE.md):
+//     generatePolicyProof returns a verifying Groth16 proof for every
+//     turn whose action follows the circuit policy (strategy.mjs).
+//     A proof failure (bad input, wrong action, timeout) still falls
+//     back to HOLD with no proof — fail-closed, never a fabricated proof.
 //   - Fail closed: any error/uncertainty → Gatekeeper REJECT, Steal HOLD.
 //   - 60s hard deadline: Steal proving is capped at a 10s hard timeout
 //     (measured Gatekeeper ~1s); the decision itself is synchronous.
@@ -275,11 +275,12 @@ async function tryProve(input, decision, taskId) {
 // ---- proving (Groth16, Steal — best-effort, fail-closed) ------------------
 // tryProveSteal returns { proof, public_signals } or null. Null means
 // "no proof" — the caller returns HOLD. It NEVER throws.
-// CURRENT STATUS (see prove-steal.mjs CIRCUIT-BLOCKER): the vfy-policy
-// witness fails at template asserts 72/90/149 for every input tried,
-// so this returns null on every turn until the circuit inputs are
-// resolved. That is the intended fail-closed behaviour, NOT a bug to
-// work around by patching the wasm or by submitting an unverified proof.
+// The circuit is SOLVED (circuit-steal/WIRING-TRACE.md): a valid turn
+// (action = the circuit-policy action for the balances) generates a
+// verifying proof. Null only on genuine failure (bad input, wrong
+// action, timeout) — that is the intended fail-closed behaviour, NOT a
+// bug to work around by patching the wasm or by submitting an
+// unverified proof.
 async function tryProveSteal({ matchId, turn, state: st, action }) {
   let timer;
   try {
@@ -604,8 +605,8 @@ async function handleAgent(req, res) {
     // (fail-closed) rather than the strategy action, because the
     // platform resolves a proof-less turn as HOLD anyway — declaring
     // an EXTRACT that will not be applied would be misleading.
-    // When the circuit is resolved and a proof IS generated, the
-    // strategy action is returned WITH the proof.
+    // When the proof IS generated, the strategy action is returned
+    // WITH the proof (the normal case now that the circuit is solved).
     let finalResponse = response;
     if (persisted) {
       const provePromise = (async () => {
