@@ -443,6 +443,30 @@ async function main() {
       `status=${r.status} body=${r.body.slice(0, 160)}`,
     );
 
+    // Practice mode (mode 'practice', no strategyCommitment at all):
+    // the platform dispatches Steal practice turns off-chain without a
+    // pairing commitment, so the commitment check must not block them
+    // (observed live 2026-11-16: practice turns HOLDed in ~35ms with no
+    // proof on every scenario). Must still prove (EXTRACT + verifying
+    // proof) exactly like a competition turn.
+    {
+      const envP = turnEnv({
+        matchId: '9f4e1b2a-5555-4222-8333-444455556666',
+        mode: 'practice',
+      });
+      delete envP.strategyCommitment;
+      r = await request({ body: envP, secret: STEAL_SECRET });
+      j = parse(r);
+      const proofOk = j?.policyProof?.proof && Array.isArray(j.policyProof.public_signals)
+        ? await verifyPolicyProof(j.policyProof.proof, j.policyProof.public_signals)
+        : false;
+      check(
+        'practice mode without commitment → EXTRACT 10 + verifying proof (commitment check skipped for practice)',
+        r.status === 200 && j?.action?.type === 'EXTRACT' && j?.action?.amount === 10 && proofOk === true,
+        `status=${r.status} body=${r.body.slice(0, 200)} proofOk=${proofOk}`,
+      );
+    }
+
     // Turn out of range (0 and 21) → HOLD.
     for (const badTurn of [0, 21]) {
       r = await request({
@@ -577,13 +601,14 @@ async function main() {
       const hasValid2222 = ids.includes('9f4e1b2a-2222-4222-8333-444455556666');
       const hasValid9999 = ids.includes('9f4e1b2a-9999-4222-8333-444455556666');
       const hasValidBbbb = ids.includes('9f4e1b2a-bbbb-4222-8333-444455556666');
+      const hasValid5555 = ids.includes('9f4e1b2a-5555-4222-8333-444455556666');
       const hasInvalid3333 = ids.includes('9f4e1b2a-3333-4222-8333-444455556666');
       const hasInvalid4444 = ids.includes('9f4e1b2a-4444-4222-8333-444455556666');
       const hasInvalid8888 = ids.includes('9f4e1b2a-8888-4222-8333-444455556666');
       const hasInvalidAaaa = ids.includes('9f4e1b2a-aaaa-4222-8333-444455556666');
       // Valid stored turns must carry a verifying proof.
       let storedProofsOk = true;
-      for (const id of ['9f4e1b2a-1111-4222-8333-444455556666', '9f4e1b2a-2222-4222-8333-444455556666', '9f4e1b2a-9999-4222-8333-444455556666', '9f4e1b2a-bbbb-4222-8333-444455556666']) {
+      for (const id of ['9f4e1b2a-1111-4222-8333-444455556666', '9f4e1b2a-2222-4222-8333-444455556666', '9f4e1b2a-9999-4222-8333-444455556666', '9f4e1b2a-bbbb-4222-8333-444455556666', '9f4e1b2a-5555-4222-8333-444455556666']) {
         const turns = saved.stealMatches[id] || {};
         for (const tk of Object.keys(turns)) {
           const rec = turns[tk];
@@ -593,7 +618,7 @@ async function main() {
       }
       check(
         'state.json persisted ONLY valid stealMatches (invalid turns not stored) + stored turns carry verifying proofs',
-        ids.length === 4 && hasValid1111 && hasValid2222 && hasValid9999 && hasValidBbbb &&
+        ids.length === 5 && hasValid1111 && hasValid2222 && hasValid9999 && hasValidBbbb && hasValid5555 &&
           !hasInvalid3333 && !hasInvalid4444 && !hasInvalid8888 && !hasInvalidAaaa &&
           storedProofsOk,
         `matches=${ids.join(',')} storedProofsOk=${storedProofsOk}`,

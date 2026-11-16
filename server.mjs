@@ -518,6 +518,19 @@ async function handleAgent(req, res) {
       env.strategyCommitment && typeof env.strategyCommitment.hash === 'string'
         ? env.strategyCommitment.hash.trim().toLowerCase()
         : '';
+    const mode = typeof env.mode === 'string' ? env.mode : '';
+    // Practice turns (mode 'practice') are dispatched off-chain without
+    // a pairing: the platform may omit strategyCommitment or send the
+    // circuit vk_hash instead of the registered Poseidon commitment
+    // (observed 2026-11-16: all Steal practice turns HOLDed in ~35ms
+    // with no proof, on every scenario, while live-shaped turns prove
+    // fine). The commitment check binds LIVE (competition) turns to the
+    // registered strategy; it does not apply to practice, where the
+    // signed request itself (Steal secret) proves the turn is for us.
+    // Live turns still require the registered hash, unchanged.
+    const commitmentOk =
+      mode === 'practice' ||
+      commitmentHash === STEAL_COMMITMENT.toLowerCase();
     const toNum = (v) => {
       if (v === undefined || v === null || v === '') return null;
       const n = Number(v);
@@ -536,8 +549,18 @@ async function handleAgent(req, res) {
       !!st &&
       toNum(st.selfBalance) !== null &&
       toNum(st.opponentBalance) !== null &&
-      commitmentHash === STEAL_COMMITMENT.toLowerCase();
+      commitmentOk;
     if (!usable) {
+      // Diagnostic only (no secrets: balances and the commitment hash
+      // are public game data). Without this, a HOLD is silent and the
+      // cause (bad state vs. wrong commitment) is unknowable from logs.
+      console.error(
+        `steal HOLD unusable match ${matchId} turn ${turn}: ` +
+          `matchId=${!!matchId} turnOk=${turn >= 1 && turn <= 20} ` +
+          `state=${!!st} selfBal=${st ? st.selfBalance : '-'} ` +
+          `oppBal=${st ? st.opponentBalance : '-'} ` +
+          `commitmentHash=${commitmentHash || '(missing)'} mode=${mode || '(missing)'}`,
+      );
       sendSigned(
         res,
         200,
